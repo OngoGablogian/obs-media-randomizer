@@ -9,7 +9,8 @@
  *
  * Threading model: hotkeys/buttons only set atomic flags. All creation and
  * destruction of the child source happens in video_tick (graphics thread).
- * The render and audio threads take a reference to the child under a mutex.
+ * The render thread takes a reference to the child under a mutex. The clip's
+ * audio is relayed through this source via an audio capture callback.
  */
 
 #include <obs-module.h>
@@ -62,6 +63,10 @@ struct random_clip {
 	/* graphics-thread only */
 	char *last_file;
 	uint64_t clip_start_ns;
+
+	/* OBS audio format, read once at creation */
+	enum speaker_layout speakers;
+	uint32_t samples_per_sec;
 
 	volatile bool play_requested;
 	volatile bool stop_requested;
@@ -179,6 +184,26 @@ static obs_source_t *get_child_ref(struct random_clip *rc)
 	return child;
 }
 
+/* Relays the clip's audio (already converted to OBS's mix format) out of this
+ * source, so it gets this source's mixer fader, filters and monitoring. */
+static void forward_audio(void *param, obs_source_t *child, const struct audio_data *audio, bool muted)
+{
+	UNUSED_PARAMETER(child);
+	UNUSED_PARAMETER(muted);
+	struct random_clip *rc = param;
+
+	struct obs_source_audio out = {0};
+	for (size_t i = 0; i < MAX_AV_PLANES; i++)
+		out.data[i] = audio->data[i];
+	out.frames = audio->frames;
+	out.speakers = rc->speakers;
+	out.format = AUDIO_FORMAT_FLOAT_PLANAR;
+	out.samples_per_sec = rc->samples_per_sec;
+	out.timestamp = audio->timestamp;
+
+	obs_source_output_audio(rc->source, &out);
+}
+
 static void stop_clip(struct random_clip *rc)
 {
 	pthread_mutex_lock(&rc->mutex);
@@ -187,6 +212,7 @@ static void stop_clip(struct random_clip *rc)
 	pthread_mutex_unlock(&rc->mutex);
 
 	if (child) {
+		obs_source_remove_audio_capture_callback(child, forward_audio, rc);
 		obs_source_remove_active_child(rc->source, child);
 		obs_source_release(child); /* destroys the decoder and closes the file */
 	}
@@ -231,6 +257,7 @@ static void start_clip(struct random_clip *rc)
 	rc->child = child;
 	pthread_mutex_unlock(&rc->mutex);
 
+	obs_source_add_audio_capture_callback(child, forward_audio, rc);
 	obs_source_add_active_child(rc->source, child);
 }
 
@@ -325,6 +352,15 @@ static void *rc_create(obs_data_t *settings, obs_source_t *source)
 {
 	struct random_clip *rc = bzalloc(sizeof(*rc));
 	rc->source = source;
+
+	struct obs_audio_info oai = {0};
+	if (obs_get_audio_info(&oai)) {
+		rc->speakers = oai.speakers;
+		rc->samples_per_sec = oai.samples_per_sec;
+	} else {
+		rc->speakers = SPEAKERS_STEREO;
+		rc->samples_per_sec = 48000;
+	}
 
 	if (pthread_mutex_init(&rc->mutex, NULL) != 0) {
 		bfree(rc);
@@ -470,43 +506,6 @@ static uint32_t rc_get_height(void *data)
 	return rc->cy;
 }
 
-static bool rc_audio_render(void *data, uint64_t *ts_out, struct obs_source_audio_mix *audio_output, uint32_t mixers,
-			    size_t channels, size_t sample_rate)
-{
-	UNUSED_PARAMETER(sample_rate);
-	struct random_clip *rc = data;
-
-	obs_source_t *child = get_child_ref(rc);
-	if (!child)
-		return false;
-
-	bool success = false;
-	if (!obs_source_audio_pending(child)) {
-		uint64_t ts = obs_source_get_audio_timestamp(child);
-		if (ts) {
-			struct obs_source_audio_mix child_audio;
-			obs_source_get_audio_mix(child, &child_audio);
-
-			for (size_t mix = 0; mix < MAX_AUDIO_MIXES; mix++) {
-				if ((mixers & (1 << mix)) == 0)
-					continue;
-				for (size_t ch = 0; ch < channels; ch++) {
-					float *out = audio_output->output[mix].data[ch];
-					const float *in = child_audio.output[mix].data[ch];
-					if (out && in)
-						memcpy(out, in, AUDIO_OUTPUT_FRAMES * sizeof(float));
-				}
-			}
-
-			*ts_out = ts;
-			success = true;
-		}
-	}
-
-	obs_source_release(child);
-	return success;
-}
-
 static void rc_enum_sources(void *data, obs_source_enum_proc_t enum_callback, void *param)
 {
 	struct random_clip *rc = data;
@@ -520,8 +519,7 @@ static void rc_enum_sources(void *data, obs_source_enum_proc_t enum_callback, vo
 struct obs_source_info random_clip_source_info = {
 	.id = "random_clip_player",
 	.type = OBS_SOURCE_TYPE_INPUT,
-	.output_flags = OBS_SOURCE_VIDEO | OBS_SOURCE_AUDIO | OBS_SOURCE_CUSTOM_DRAW | OBS_SOURCE_COMPOSITE |
-			OBS_SOURCE_DO_NOT_DUPLICATE,
+	.output_flags = OBS_SOURCE_VIDEO | OBS_SOURCE_AUDIO | OBS_SOURCE_CUSTOM_DRAW | OBS_SOURCE_DO_NOT_DUPLICATE,
 	.icon_type = OBS_ICON_TYPE_MEDIA,
 	.get_name = rc_get_name,
 	.create = rc_create,
@@ -534,7 +532,6 @@ struct obs_source_info random_clip_source_info = {
 	.get_width = rc_get_width,
 	.get_height = rc_get_height,
 	.hide = rc_hide,
-	.audio_render = rc_audio_render,
 	.enum_active_sources = rc_enum_sources,
 	.enum_all_sources = rc_enum_sources,
 };
