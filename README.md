@@ -1,59 +1,70 @@
-# OBS Plugin Template
+# OBS Random Clip
 
-## Introduction
+An OBS Studio source plugin that plays a random video clip from a folder when you press a hotkey. When the clip finishes, it disappears and is completely unloaded, so nothing is held in memory or decoding while it's idle.
 
-The plugin template is meant to be used as a starting point for OBS Studio plugin development. It includes:
+## Features
 
-* Boilerplate plugin source code
-* A CMake project file
-* GitHub Actions workflows and repository actions
+- Adds a **Random Clip Player** source you can put in any scene
+- One hotkey plays a random clip, and an optional second hotkey stops it
+- Each clip plays once, then the video closes and its decoder is unloaded
+- The folder is rescanned on every press, so new clips are picked up without restarting OBS
+- Optionally searches subfolders and avoids playing the same clip twice in a row
+- Clip audio comes through the source's own mixer channel, so volume, filters and monitoring work as normal
+- Clips are scaled to fit the source and centered, so the source's size and position in the scene stay the same between clips
+- Lightweight: folder scanning and clip loading happen off OBS's render thread, and the plugin does almost nothing while idle
 
-## Supported Build Environments
+## Requirements
 
-| Platform  | Tool   |
-|-----------|--------|
-| Windows   | Visual Studio 17 2022 |
-| macOS     | XCode 16.0 |
-| Windows, macOS  | CMake 3.30.5 |
-| Ubuntu 24.04 | CMake 3.28.3 |
-| Ubuntu 24.04 | `ninja-build` |
-| Ubuntu 24.04 | `pkg-config`
-| Ubuntu 24.04 | `build-essential` |
+- OBS Studio 31 or newer
+- Windows, macOS or Linux
 
-## Quick Start
+## Installation
 
-An absolute bare-bones [Quick Start Guide](https://github.com/obsproject/obs-plugintemplate/wiki/Quick-Start-Guide) is available in the wiki.
+1. Download the latest build from the [Releases](https://github.com/OngoGablogian/obs-random-clip/releases) page.
+2. Extract it so that the plugin ends up here:
+   - **Windows:** `C:\ProgramData\obs-studio\plugins\obs-random-clip\`
+   - **Linux:** `~/.config/obs-studio/plugins/obs-random-clip/`
+3. Restart OBS.
 
-## Documentation
+The folder should contain `bin\64bit\obs-random-clip.dll` (or `.so` on Linux) and `data\locale\en-US.ini`.
 
-All documentation can be found in the [Plugin Template Wiki](https://github.com/obsproject/obs-plugintemplate/wiki).
+## Usage
 
-Suggested reading to get up and running:
+1. In the **Sources** panel, click **+** and choose **Random Clip Player**.
+2. In the properties window, set **Clip Folder** to the folder with your videos.
+3. Go to **File → Settings → Hotkeys**, find your source by name, and set a key for **Play Random Clip**. You can also set one for **Stop Clip**.
+4. Press the hotkey to play a random clip.
 
-* [Getting started](https://github.com/obsproject/obs-plugintemplate/wiki/Getting-Started)
-* [Build system requirements](https://github.com/obsproject/obs-plugintemplate/wiki/Build-System-Requirements)
-* [Build system options](https://github.com/obsproject/obs-plugintemplate/wiki/CMake-Build-System-Options)
+You can also use the **Play Random Clip** and **Stop Clip** buttons in the source's properties to test it.
 
-## GitHub Actions & CI
+## Settings
 
-Default GitHub Actions workflows are available for the following repository actions:
+| Setting | Default | Description |
+|---|---|---|
+| Clip Folder | – | Folder to pick clips from |
+| Include subfolders | Off | Also search subfolders, up to 8 levels deep |
+| Don't play the same clip twice in a row | On | Skips the clip that played last |
+| Hotkey while a clip is playing starts a new clip | On | When off, presses during a clip are ignored |
+| Stop the clip when the source is hidden | On | Stops the clip when the source is hidden or its scene goes out of view |
+| Use hardware decoding when available | Off | Decodes clips on the GPU instead of the CPU |
+| Width / Height | Canvas size | Size of the source. Clips are scaled to fit and centered |
 
-* `push`: Run for commits or tags pushed to `master` or `main` branches.
-* `pr-pull`: Run when a Pull Request has been pushed or synchronized.
-* `dispatch`: Run when triggered by the workflow dispatch in GitHub's user interface.
-* `build-project`: Builds the actual project and is triggered by other workflows.
-* `check-format`: Checks CMake and plugin source code formatting and is triggered by other workflows.
+**Supported formats:** mp4, mkv, mov, webm, avi, flv, m4v, ts, mts, m2ts, mpg, mpeg, wmv, gif
 
-The workflows make use of GitHub repository actions (contained in `.github/actions`) and build scripts (contained in `.github/scripts`) which are not needed for local development, but might need to be adjusted if additional/different steps are required to build the plugin.
+## Performance tips
 
-### Retrieving build artifacts
+- Clips that match your canvas resolution (for example 1080p H.264) are the cheapest to decode. 4K, HEVC or 10-bit AV1 clips cost more for no visible benefit on a 1080p canvas.
+- Turn on **Use hardware decoding** if your clips are large or high bitrate.
+- Keep clips on a local drive (an SSD if possible) rather than a network share.
 
-Successful builds on GitHub Actions will produce build artifacts that can be downloaded for testing. These artifacts are commonly simple archives and will not contain package installers or installation programs.
+## Building
 
-### Building a Release
+This project is based on [obs-plugintemplate](https://github.com/obsproject/obs-plugintemplate).
 
-To create a release, an appropriately named tag needs to be pushed to the `main`/`master` branch using semantic versioning (e.g., `12.3.4`, `23.4.5-beta2`). A draft release will be created on the associated repository with generated installer packages or installation programs attached as release artifacts.
+**With GitHub Actions:** pushing to `main` builds Windows, macOS and Linux packages. You can download them from the workflow run's **Artifacts**. Pushing a version tag (for example `1.0.0`) also creates a draft release with the packages attached.
 
-## Signing and Notarizing on macOS
+**Locally:** follow the [obs-plugintemplate build instructions](https://github.com/obsproject/obs-plugintemplate/wiki/Quick-Start-Guide) for your platform, using the presets in `CMakePresets.json`.
 
-Basic concepts of codesigning and notarization on macOS are explained in the correspodning [Wiki article](https://github.com/obsproject/obs-plugintemplate/wiki/Codesigning-On-macOS) which has a specific section for the [GitHub Actions setup](https://github.com/obsproject/obs-plugintemplate/wiki/Codesigning-On-macOS#setting-up-code-signing-for-github-actions).
+## License
+
+GPL-2.0. See [LICENSE](LICENSE).

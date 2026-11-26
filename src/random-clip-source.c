@@ -7,10 +7,16 @@
  * stopped, that child source is destroyed, so no file handles, decoder
  * threads or frame buffers are held while idle.
  *
- * Threading model: hotkeys/buttons only set atomic flags. All creation and
- * destruction of the child source happens in video_tick (graphics thread).
- * The render thread takes a reference to the child under a mutex. The clip's
- * audio is relayed through this source via an audio capture callback.
+ * Threading model:
+ *  - Hotkeys/buttons only set atomic flags.
+ *  - The folder scan and media source creation run on a background worker,
+ *    so disk access never stalls OBS's render thread.
+ *  - video_tick (graphics thread) installs the loaded clip and unloads it
+ *    when it ends. OBS itself destroys released sources on a background
+ *    thread.
+ *  - While idle, tick and render return after a single atomic read.
+ *  - The clip's audio is relayed through this source via an audio capture
+ *    callback.
  */
 
 #include <obs-module.h>
@@ -18,6 +24,7 @@
 #include <util/threading.h>
 #include <util/bmem.h>
 #include <util/dstr.h>
+#include <util/task.h>
 
 #include <stdlib.h>
 #include <string.h>
@@ -50,8 +57,11 @@ struct random_clip {
 	obs_source_t *source;
 
 	pthread_mutex_t mutex;
-	obs_source_t *child; /* protected by mutex */
-	char *folder;        /* protected by mutex */
+	obs_source_t *child;         /* protected by mutex */
+	obs_source_t *pending_child; /* loaded by worker, protected by mutex */
+	char *pending_path;          /* protected by mutex */
+	char *last_file;             /* protected by mutex */
+	char *folder;                /* protected by mutex */
 	bool recursive;
 	bool no_repeat;
 	bool interrupt;
@@ -61,8 +71,14 @@ struct random_clip {
 	uint32_t cy;
 
 	/* graphics-thread only */
-	char *last_file;
 	uint64_t clip_start_ns;
+	long load_gen;
+
+	os_task_queue_t *loader;
+	long gen; /* protected by mutex; bumped on stop to cancel in-flight loads */
+	volatile bool loading;
+	volatile bool pending_ready;
+	volatile bool has_clip; /* fast idle check for tick/render */
 
 	/* OBS audio format, read once at creation */
 	enum speaker_layout speakers;
@@ -142,9 +158,11 @@ static char *pick_random_file(struct random_clip *rc)
 	char *folder = rc->folder ? bstrdup(rc->folder) : NULL;
 	bool recursive = rc->recursive;
 	bool no_repeat = rc->no_repeat;
+	char *last = rc->last_file ? bstrdup(rc->last_file) : NULL;
 	pthread_mutex_unlock(&rc->mutex);
 
 	if (!folder || !*folder) {
+		bfree(last);
 		blog(LOG_WARNING, "[Random Clip Player] No folder selected");
 		bfree(folder);
 		return NULL;
@@ -160,7 +178,7 @@ static char *pick_random_file(struct random_clip *rc)
 		size_t idx = (size_t)rand() % files.num;
 
 		/* avoid playing the same clip twice in a row */
-		if (no_repeat && files.num > 1 && rc->last_file && strcmp(files.items[idx], rc->last_file) == 0) {
+		if (no_repeat && files.num > 1 && last && strcmp(files.items[idx], last) == 0) {
 			idx = (idx + 1 + (size_t)rand() % (files.num - 1)) % files.num;
 		}
 
@@ -170,11 +188,12 @@ static char *pick_random_file(struct random_clip *rc)
 
 	file_list_free(&files);
 	bfree(folder);
+	bfree(last);
 	return result;
 }
 
 /* ------------------------------------------------------------------------- */
-/* Child (clip) management - graphics thread only                             */
+/* Child (clip) management                                                   */
 
 static obs_source_t *get_child_ref(struct random_clip *rc)
 {
@@ -210,6 +229,7 @@ static void stop_clip(struct random_clip *rc)
 	obs_source_t *child = rc->child;
 	rc->child = NULL;
 	pthread_mutex_unlock(&rc->mutex);
+	os_atomic_set_bool(&rc->has_clip, false);
 
 	if (child) {
 		obs_source_remove_audio_capture_callback(child, forward_audio, rc);
@@ -218,47 +238,106 @@ static void stop_clip(struct random_clip *rc)
 	}
 }
 
-static void start_clip(struct random_clip *rc)
+/* Background worker: scan the folder, pick a clip and create its decoder. */
+static void load_task(void *param)
 {
-	char *path = pick_random_file(rc);
-	if (!path)
-		return;
+	struct random_clip *rc = param;
+	long gen = rc->load_gen;
 
+	char *path = pick_random_file(rc);
+	obs_source_t *child = NULL;
+
+	if (path) {
+		pthread_mutex_lock(&rc->mutex);
+		bool hw_decode = rc->hw_decode;
+		pthread_mutex_unlock(&rc->mutex);
+
+		obs_data_t *settings = obs_data_create();
+		obs_data_set_bool(settings, "is_local_file", true);
+		obs_data_set_string(settings, "local_file", path);
+		obs_data_set_bool(settings, "looping", false);
+		obs_data_set_bool(settings, "restart_on_activate", false); /* start immediately */
+		obs_data_set_bool(settings, "close_when_inactive", false);
+		obs_data_set_bool(settings, "clear_on_media_end", true);
+		obs_data_set_bool(settings, "full_decode", false); /* stream from disk, don't preload */
+		obs_data_set_bool(settings, "hw_decode", hw_decode);
+		obs_data_set_int(settings, "speed_percent", 100);
+
+		child = obs_source_create_private("ffmpeg_source", "Random Clip Player (clip)", settings);
+		obs_data_release(settings);
+
+		if (!child)
+			blog(LOG_ERROR, "[Random Clip Player] Failed to create media source for '%s'", path);
+	}
+
+	if (child) {
+		/* hand off, unless a stop/hide happened while loading */
+		pthread_mutex_lock(&rc->mutex);
+		bool cancelled = gen != rc->gen;
+		if (!cancelled) {
+			rc->pending_child = child;
+			rc->pending_path = path;
+		}
+		pthread_mutex_unlock(&rc->mutex);
+
+		if (cancelled) {
+			obs_source_release(child);
+			bfree(path);
+		} else {
+			os_atomic_set_bool(&rc->pending_ready, true);
+		}
+	} else {
+		bfree(path);
+	}
+
+	os_atomic_set_bool(&rc->loading, false);
+}
+
+/* Cancels any in-flight load and drops a loaded-but-not-yet-shown clip. */
+static void cancel_loads(struct random_clip *rc)
+{
 	pthread_mutex_lock(&rc->mutex);
-	bool hw_decode = rc->hw_decode;
+	rc->gen++;
+	obs_source_t *child = rc->pending_child;
+	char *path = rc->pending_path;
+	rc->pending_child = NULL;
+	rc->pending_path = NULL;
+	pthread_mutex_unlock(&rc->mutex);
+	os_atomic_set_bool(&rc->pending_ready, false);
+
+	obs_source_release(child);
+	bfree(path);
+}
+
+/* Graphics thread: swap in the clip the worker loaded. */
+static void install_pending(struct random_clip *rc)
+{
+	pthread_mutex_lock(&rc->mutex);
+	obs_source_t *child = rc->pending_child;
+	char *path = rc->pending_path;
+	rc->pending_child = NULL;
+	rc->pending_path = NULL;
 	pthread_mutex_unlock(&rc->mutex);
 
-	obs_data_t *settings = obs_data_create();
-	obs_data_set_bool(settings, "is_local_file", true);
-	obs_data_set_string(settings, "local_file", path);
-	obs_data_set_bool(settings, "looping", false);
-	obs_data_set_bool(settings, "restart_on_activate", false); /* start immediately */
-	obs_data_set_bool(settings, "close_when_inactive", false);
-	obs_data_set_bool(settings, "clear_on_media_end", true);
-	obs_data_set_bool(settings, "hw_decode", hw_decode);
-	obs_data_set_int(settings, "speed_percent", 100);
-
-	obs_source_t *child = obs_source_create_private("ffmpeg_source", "Random Clip Player (clip)", settings);
-	obs_data_release(settings);
-
 	if (!child) {
-		blog(LOG_ERROR, "[Random Clip Player] Failed to create media source for '%s'", path);
 		bfree(path);
 		return;
 	}
 
+	stop_clip(rc);
+
 	blog(LOG_INFO, "[Random Clip Player] Playing '%s'", path);
 
+	pthread_mutex_lock(&rc->mutex);
 	bfree(rc->last_file);
 	rc->last_file = path;
-	rc->clip_start_ns = os_gettime_ns();
-
-	pthread_mutex_lock(&rc->mutex);
 	rc->child = child;
 	pthread_mutex_unlock(&rc->mutex);
 
+	rc->clip_start_ns = os_gettime_ns();
 	obs_source_add_audio_capture_callback(child, forward_audio, rc);
 	obs_source_add_active_child(rc->source, child);
+	os_atomic_set_bool(&rc->has_clip, true);
 }
 
 static bool clip_finished(struct random_clip *rc, obs_source_t *child)
@@ -367,6 +446,8 @@ static void *rc_create(obs_data_t *settings, obs_source_t *source)
 		return NULL;
 	}
 
+	rc->loader = os_task_queue_create();
+
 	rc->play_hotkey =
 		obs_hotkey_register_source(source, "RandomClipPlayer.Play", T_("PlayRandomClip"), play_hotkey_cb, rc);
 	rc->stop_hotkey =
@@ -379,6 +460,9 @@ static void *rc_create(obs_data_t *settings, obs_source_t *source)
 static void rc_destroy(void *data)
 {
 	struct random_clip *rc = data;
+	cancel_loads(rc);
+	os_task_queue_destroy(rc->loader); /* waits for any in-flight load */
+	cancel_loads(rc);
 	stop_clip(rc);
 	bfree(rc->folder);
 	bfree(rc->last_file);
@@ -429,20 +513,30 @@ static void rc_tick(void *data, float seconds)
 
 	if (os_atomic_set_bool(&rc->stop_requested, false)) {
 		os_atomic_set_bool(&rc->play_requested, false);
+		cancel_loads(rc);
 		stop_clip(rc);
 	}
 
 	if (os_atomic_set_bool(&rc->play_requested, false)) {
 		pthread_mutex_lock(&rc->mutex);
-		bool playing = rc->child != NULL;
 		bool interrupt = rc->interrupt;
 		pthread_mutex_unlock(&rc->mutex);
 
-		if (!playing || interrupt) {
-			stop_clip(rc);
-			start_clip(rc);
+		bool playing = os_atomic_load_bool(&rc->has_clip);
+		if ((!playing || interrupt) && rc->loader && !os_atomic_set_bool(&rc->loading, true)) {
+			pthread_mutex_lock(&rc->mutex);
+			rc->load_gen = rc->gen;
+			pthread_mutex_unlock(&rc->mutex);
+			if (!os_task_queue_queue_task(rc->loader, load_task, rc))
+				os_atomic_set_bool(&rc->loading, false);
 		}
 	}
+
+	if (os_atomic_set_bool(&rc->pending_ready, false))
+		install_pending(rc);
+
+	if (!os_atomic_load_bool(&rc->has_clip))
+		return;
 
 	/* Unload as soon as the clip is done */
 	obs_source_t *child = get_child_ref(rc);
@@ -468,6 +562,9 @@ static void rc_render(void *data, gs_effect_t *effect)
 {
 	UNUSED_PARAMETER(effect);
 	struct random_clip *rc = data;
+
+	if (!os_atomic_load_bool(&rc->has_clip))
+		return;
 
 	obs_source_t *child = get_child_ref(rc);
 	if (!child)
