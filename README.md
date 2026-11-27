@@ -9,9 +9,12 @@ An OBS Studio source plugin that plays a random video clip from a folder when yo
 - Each clip plays once, then the video closes and its decoder is unloaded
 - The folder is rescanned on every press, so new clips are picked up without restarting OBS
 - Optionally searches subfolders and avoids playing the same clip twice in a row
+- **Loop mode:** keeps playing random clips back to back, going through every clip in the folder once before any repeats, until you stop it or switch scenes
+- **Auto-start:** starts playing automatically when you switch to a scene that contains the source, and works together with loop mode
+- Stops the clip when you switch scenes by default
 - Clip audio comes through the source's own mixer channel, so volume, filters and monitoring work as normal
 - Clips are scaled to fit the source and centered, so the source's size and position in the scene stay the same between clips
-- Lightweight: folder scanning and clip loading happen off OBS's render thread, and the plugin does almost nothing while idle
+- Lightweight: folder scanning and clip loading happen off OBS's render thread, only one clip is ever loaded at a time (even when looping), and the plugin does almost nothing while idle
 
 ## Requirements
 
@@ -44,7 +47,10 @@ You can also use the **Play Random Clip** and **Stop Clip** buttons in the sourc
 | Clip Folder | – | Folder to pick clips from |
 | Include subfolders | Off | Also search subfolders, up to 8 levels deep |
 | Don't play the same clip twice in a row | On | Skips the clip that played last |
-| Hotkey while a clip is playing starts a new clip | On | When off, presses during a clip are ignored |
+| Hotkey while a clip is playing starts a new clip | On | When off, presses during a clip are ignored. In loop mode this skips to the next clip |
+| Loop random clips until stopped or the scene changes | Off | Plays random clips back to back. Every clip plays once before any repeats. Ends when you press **Stop Clip**, the source is hidden, or the scene changes |
+| Start playing automatically when switching to a scene with this source | Off | Starts a clip (or a loop, if loop mode is on) when you switch to a scene where the source is visible |
+| Stop the clip when the scene changes | On | Stops the clip on any scene switch, even if the new scene also contains this source |
 | Stop the clip when the source is hidden | On | Stops the clip when the source is hidden or its scene goes out of view |
 | Use hardware decoding when available | Off | Decodes clips on the GPU instead of the CPU |
 | Width / Height | Canvas size | Size of the source. Clips are scaled to fit and centered |

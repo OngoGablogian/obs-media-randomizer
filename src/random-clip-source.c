@@ -7,14 +7,23 @@
  * stopped, that child source is destroyed, so no file handles, decoder
  * threads or frame buffers are held while idle.
  *
+ * Optional modes:
+ *  - Loop: keep playing random clips (shuffled, every clip once per round)
+ *    until stopped, hidden, or the scene changes.
+ *  - Auto-start: start playing when the program scene switches to a scene
+ *    that shows this source.
+ *  - Stop on scene change (default on): stop the clip on any scene switch,
+ *    even if the new scene also contains this source.
+ *
  * Threading model:
- *  - Hotkeys/buttons only set atomic flags.
+ *  - Hotkeys/buttons/frontend events only set atomic flags.
  *  - The folder scan and media source creation run on a background worker,
  *    so disk access never stalls OBS's render thread.
  *  - video_tick (graphics thread) installs the loaded clip and unloads it
  *    when it ends. OBS itself destroys released sources on a background
  *    thread.
- *  - While idle, tick and render return after a single atomic read.
+ *  - While idle, tick does a few atomic reads and render returns after one.
+ *  - Only one clip is ever loaded at a time, including in loop mode.
  *  - The clip's audio is relayed through this source via an audio capture
  *    callback.
  */
@@ -29,10 +38,15 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include "random-clip-source.h"
+
 #define S_FOLDER "folder"
 #define S_RECURSIVE "recursive"
 #define S_NO_REPEAT "no_repeat"
 #define S_INTERRUPT "interrupt"
+#define S_LOOP "loop"
+#define S_AUTOSTART "autostart"
+#define S_STOP_ON_SCENE "stop_on_scene_change"
 #define S_STOP_ON_HIDE "stop_on_hide"
 #define S_HW_DECODE "hw_decode"
 #define S_WIDTH "width"
@@ -40,12 +54,17 @@
 
 #define T_(s) obs_module_text(s)
 
+#define SOURCE_ID "random_clip_player"
 #define MAX_SCAN_DEPTH 8
+#define MAX_LOOP_FAILURES 3                    /* end a loop after this many unplayable clips in a row */
 #define START_TIMEOUT_NS (10ULL * 1000000000ULL) /* give up if a clip never starts */
 #define MIN_CLIP_AGE_NS (500ULL * 1000000ULL)    /* ignore state checks right after start */
 
 static const char *video_exts[] = {".mp4", ".mkv", ".mov",  ".webm", ".avi",  ".flv", ".m4v",
 				   ".ts",  ".mts", ".m2ts", ".mpg",  ".mpeg", ".wmv", ".gif"};
+
+/* Bumped by the frontend whenever the program scene changes. */
+static volatile long scene_gen = 0;
 
 struct file_list {
 	char **items;
@@ -61,10 +80,14 @@ struct random_clip {
 	obs_source_t *pending_child; /* loaded by worker, protected by mutex */
 	char *pending_path;          /* protected by mutex */
 	char *last_file;             /* protected by mutex */
+	struct file_list played;     /* clips played this loop round, protected by mutex */
 	char *folder;                /* protected by mutex */
 	bool recursive;
 	bool no_repeat;
 	bool interrupt;
+	bool loop;
+	bool autostart;
+	bool stop_on_scene;
 	bool stop_on_hide;
 	bool hw_decode;
 	uint32_t cx;
@@ -72,13 +95,21 @@ struct random_clip {
 
 	/* graphics-thread only */
 	uint64_t clip_start_ns;
+	bool clip_played; /* current clip reached the playing state */
+	bool looping;     /* a loop session is running */
+	int loop_failures;
+	long seen_scene_gen;
+
+	/* set by graphics thread before queueing a load, read by the worker */
 	long load_gen;
+	bool load_shuffle;
 
 	os_task_queue_t *loader;
 	long gen; /* protected by mutex; bumped on stop to cancel in-flight loads */
 	volatile bool loading;
 	volatile bool pending_ready;
-	volatile bool has_clip; /* fast idle check for tick/render */
+	volatile bool load_empty; /* last load found nothing to play */
+	volatile bool has_clip;   /* fast idle check for tick/render */
 
 	/* OBS audio format, read once at creation */
 	enum speaker_layout speakers;
@@ -86,6 +117,7 @@ struct random_clip {
 
 	volatile bool play_requested;
 	volatile bool stop_requested;
+	volatile bool autostart_requested;
 
 	obs_hotkey_id play_hotkey;
 	obs_hotkey_id stop_hotkey;
@@ -109,6 +141,15 @@ static void file_list_free(struct file_list *list)
 		bfree(list->items[i]);
 	bfree(list->items);
 	memset(list, 0, sizeof(*list));
+}
+
+static bool file_list_contains(const struct file_list *list, const char *path)
+{
+	for (size_t i = 0; i < list->num; i++) {
+		if (strcmp(list->items[i], path) == 0)
+			return true;
+	}
+	return false;
 }
 
 static bool is_video_file(const char *name)
@@ -151,8 +192,14 @@ static void scan_folder(const char *dir_path, bool recursive, int depth, struct 
 	os_closedir(dir);
 }
 
-/* Returns a newly allocated path, or NULL if the folder has no clips. */
-static char *pick_random_file(struct random_clip *rc)
+static inline bool is_last(const char *path, const char *last)
+{
+	return last && strcmp(path, last) == 0;
+}
+
+/* Returns a newly allocated path, or NULL if the folder has no clips.
+ * shuffle: pick only clips not yet played this loop round. */
+static char *pick_random_file(struct random_clip *rc, bool shuffle)
 {
 	pthread_mutex_lock(&rc->mutex);
 	char *folder = rc->folder ? bstrdup(rc->folder) : NULL;
@@ -162,9 +209,9 @@ static char *pick_random_file(struct random_clip *rc)
 	pthread_mutex_unlock(&rc->mutex);
 
 	if (!folder || !*folder) {
-		bfree(last);
 		blog(LOG_WARNING, "[Random Clip Player] No folder selected");
 		bfree(folder);
+		bfree(last);
 		return NULL;
 	}
 
@@ -175,15 +222,47 @@ static char *pick_random_file(struct random_clip *rc)
 	if (files.num == 0) {
 		blog(LOG_WARNING, "[Random Clip Player] No video files found in '%s'", folder);
 	} else {
-		size_t idx = (size_t)rand() % files.num;
+		size_t *cand = bmalloc(files.num * sizeof(size_t));
+		size_t n = 0;
 
-		/* avoid playing the same clip twice in a row */
-		if (no_repeat && files.num > 1 && last && strcmp(files.items[idx], last) == 0) {
-			idx = (idx + 1 + (size_t)rand() % (files.num - 1)) % files.num;
+		if (shuffle) {
+			pthread_mutex_lock(&rc->mutex);
+			for (size_t i = 0; i < files.num; i++) {
+				if (!file_list_contains(&rc->played, files.items[i]))
+					cand[n++] = i;
+			}
+			if (n == 0) {
+				/* every clip has played: start a new round, but never
+				 * repeat the clip that just finished */
+				file_list_free(&rc->played);
+				for (size_t i = 0; i < files.num; i++) {
+					if (files.num == 1 || !is_last(files.items[i], last))
+						cand[n++] = i;
+				}
+			}
+			pthread_mutex_unlock(&rc->mutex);
+		} else {
+			for (size_t i = 0; i < files.num; i++) {
+				if (!no_repeat || files.num == 1 || !is_last(files.items[i], last))
+					cand[n++] = i;
+			}
 		}
 
+		if (n == 0) {
+			for (size_t i = 0; i < files.num; i++)
+				cand[n++] = i;
+		}
+
+		size_t idx = cand[(size_t)rand() % n];
 		result = files.items[idx];
 		files.items[idx] = NULL;
+		bfree(cand);
+
+		if (shuffle) {
+			pthread_mutex_lock(&rc->mutex);
+			file_list_push(&rc->played, bstrdup(result));
+			pthread_mutex_unlock(&rc->mutex);
+		}
 	}
 
 	file_list_free(&files);
@@ -243,8 +322,9 @@ static void load_task(void *param)
 {
 	struct random_clip *rc = param;
 	long gen = rc->load_gen;
+	bool shuffle = rc->load_shuffle;
 
-	char *path = pick_random_file(rc);
+	char *path = pick_random_file(rc, shuffle);
 	obs_source_t *child = NULL;
 
 	if (path) {
@@ -288,6 +368,7 @@ static void load_task(void *param)
 		}
 	} else {
 		bfree(path);
+		os_atomic_set_bool(&rc->load_empty, true);
 	}
 
 	os_atomic_set_bool(&rc->loading, false);
@@ -335,6 +416,7 @@ static void install_pending(struct random_clip *rc)
 	pthread_mutex_unlock(&rc->mutex);
 
 	rc->clip_start_ns = os_gettime_ns();
+	rc->clip_played = false;
 	obs_source_add_audio_capture_callback(child, forward_audio, rc);
 	obs_source_add_active_child(rc->source, child);
 	os_atomic_set_bool(&rc->has_clip, true);
@@ -343,21 +425,84 @@ static void install_pending(struct random_clip *rc)
 static bool clip_finished(struct random_clip *rc, obs_source_t *child)
 {
 	uint64_t age = os_gettime_ns() - rc->clip_start_ns;
-	if (age < MIN_CLIP_AGE_NS)
-		return false;
 
 	switch (obs_source_media_get_state(child)) {
+	case OBS_MEDIA_STATE_PLAYING:
+	case OBS_MEDIA_STATE_PAUSED:
+		rc->clip_played = true;
+		return false;
 	case OBS_MEDIA_STATE_ENDED:
 	case OBS_MEDIA_STATE_STOPPED:
 	case OBS_MEDIA_STATE_ERROR:
-		return true;
-	case OBS_MEDIA_STATE_PLAYING:
-	case OBS_MEDIA_STATE_PAUSED:
-		return false;
+		return age >= MIN_CLIP_AGE_NS;
 	default:
 		/* never managed to start (bad/unreadable file) */
 		return age > START_TIMEOUT_NS;
 	}
+}
+
+/* Graphics thread: queue a background load unless one is already running. */
+static void queue_load(struct random_clip *rc)
+{
+	if (!rc->loader || os_atomic_set_bool(&rc->loading, true))
+		return;
+
+	pthread_mutex_lock(&rc->mutex);
+	rc->load_gen = rc->gen;
+	rc->load_shuffle = rc->looping;
+	pthread_mutex_unlock(&rc->mutex);
+
+	if (!os_task_queue_queue_task(rc->loader, load_task, rc))
+		os_atomic_set_bool(&rc->loading, false);
+}
+
+/* Graphics thread: handle a play request (hotkey, button or auto-start).
+ * Auto-start never interrupts a clip that is already playing. */
+static void start_playing(struct random_clip *rc, bool from_autostart)
+{
+	pthread_mutex_lock(&rc->mutex);
+	bool interrupt = rc->interrupt && !from_autostart;
+	bool loop = rc->loop;
+	if (loop && !rc->looping)
+		file_list_free(&rc->played); /* new loop session: fresh shuffle */
+	pthread_mutex_unlock(&rc->mutex);
+
+	if (loop && !rc->looping) {
+		rc->looping = true;
+		rc->loop_failures = 0;
+	}
+
+	if (!os_atomic_load_bool(&rc->has_clip) || interrupt)
+		queue_load(rc);
+}
+
+static void stop_playing(struct random_clip *rc)
+{
+	rc->looping = false;
+	cancel_loads(rc);
+	stop_clip(rc);
+}
+
+/* ------------------------------------------------------------------------- */
+/* Frontend hooks (called from plugin-main.c on the UI thread)                */
+
+void random_clip_scene_changed(void)
+{
+	os_atomic_inc_long(&scene_gen);
+}
+
+void random_clip_mark_autostart(obs_source_t *parent, obs_source_t *child, void *param)
+{
+	UNUSED_PARAMETER(parent);
+	UNUSED_PARAMETER(param);
+
+	const char *id = obs_source_get_unversioned_id(child);
+	if (!id || strcmp(id, SOURCE_ID) != 0)
+		return;
+
+	struct random_clip *rc = obs_obj_get_data(child);
+	if (rc)
+		os_atomic_set_bool(&rc->autostart_requested, true);
 }
 
 /* ------------------------------------------------------------------------- */
@@ -420,6 +565,9 @@ static void rc_update(void *data, obs_data_t *settings)
 	rc->recursive = obs_data_get_bool(settings, S_RECURSIVE);
 	rc->no_repeat = obs_data_get_bool(settings, S_NO_REPEAT);
 	rc->interrupt = obs_data_get_bool(settings, S_INTERRUPT);
+	rc->loop = obs_data_get_bool(settings, S_LOOP);
+	rc->autostart = obs_data_get_bool(settings, S_AUTOSTART);
+	rc->stop_on_scene = obs_data_get_bool(settings, S_STOP_ON_SCENE);
 	rc->stop_on_hide = obs_data_get_bool(settings, S_STOP_ON_HIDE);
 	rc->hw_decode = obs_data_get_bool(settings, S_HW_DECODE);
 	rc->cx = (uint32_t)obs_data_get_int(settings, S_WIDTH);
@@ -431,6 +579,7 @@ static void *rc_create(obs_data_t *settings, obs_source_t *source)
 {
 	struct random_clip *rc = bzalloc(sizeof(*rc));
 	rc->source = source;
+	rc->seen_scene_gen = os_atomic_load_long(&scene_gen);
 
 	struct obs_audio_info oai = {0};
 	if (obs_get_audio_info(&oai)) {
@@ -466,6 +615,7 @@ static void rc_destroy(void *data)
 	stop_clip(rc);
 	bfree(rc->folder);
 	bfree(rc->last_file);
+	file_list_free(&rc->played);
 	pthread_mutex_destroy(&rc->mutex);
 	bfree(rc);
 }
@@ -482,6 +632,9 @@ static void rc_get_defaults(obs_data_t *settings)
 	obs_data_set_default_bool(settings, S_RECURSIVE, false);
 	obs_data_set_default_bool(settings, S_NO_REPEAT, true);
 	obs_data_set_default_bool(settings, S_INTERRUPT, true);
+	obs_data_set_default_bool(settings, S_LOOP, false);
+	obs_data_set_default_bool(settings, S_AUTOSTART, false);
+	obs_data_set_default_bool(settings, S_STOP_ON_SCENE, true);
 	obs_data_set_default_bool(settings, S_STOP_ON_HIDE, true);
 	obs_data_set_default_bool(settings, S_HW_DECODE, false);
 	obs_data_set_default_int(settings, S_WIDTH, w);
@@ -496,6 +649,9 @@ static obs_properties_t *rc_get_properties(void *data)
 	obs_properties_add_bool(props, S_RECURSIVE, T_("IncludeSubfolders"));
 	obs_properties_add_bool(props, S_NO_REPEAT, T_("NoRepeat"));
 	obs_properties_add_bool(props, S_INTERRUPT, T_("Interrupt"));
+	obs_properties_add_bool(props, S_LOOP, T_("Loop"));
+	obs_properties_add_bool(props, S_AUTOSTART, T_("AutoStart"));
+	obs_properties_add_bool(props, S_STOP_ON_SCENE, T_("StopOnSceneChange"));
 	obs_properties_add_bool(props, S_STOP_ON_HIDE, T_("StopOnHide"));
 	obs_properties_add_bool(props, S_HW_DECODE, T_("HardwareDecode"));
 	obs_properties_add_int(props, S_WIDTH, T_("Width"), 1, 16384, 1);
@@ -511,25 +667,44 @@ static void rc_tick(void *data, float seconds)
 	UNUSED_PARAMETER(seconds);
 	struct random_clip *rc = data;
 
-	if (os_atomic_set_bool(&rc->stop_requested, false)) {
-		os_atomic_set_bool(&rc->play_requested, false);
-		cancel_loads(rc);
-		stop_clip(rc);
-	}
+	/* Program scene changed: a loop session always ends here; the current
+	 * clip stops too unless "stop on scene change" is turned off. */
+	long sg = os_atomic_load_long(&scene_gen);
+	if (sg != rc->seen_scene_gen) {
+		rc->seen_scene_gen = sg;
+		rc->looping = false;
 
-	if (os_atomic_set_bool(&rc->play_requested, false)) {
 		pthread_mutex_lock(&rc->mutex);
-		bool interrupt = rc->interrupt;
+		bool stop = rc->stop_on_scene;
 		pthread_mutex_unlock(&rc->mutex);
 
-		bool playing = os_atomic_load_bool(&rc->has_clip);
-		if ((!playing || interrupt) && rc->loader && !os_atomic_set_bool(&rc->loading, true)) {
-			pthread_mutex_lock(&rc->mutex);
-			rc->load_gen = rc->gen;
-			pthread_mutex_unlock(&rc->mutex);
-			if (!os_task_queue_queue_task(rc->loader, load_task, rc))
-				os_atomic_set_bool(&rc->loading, false);
+		if (stop) {
+			os_atomic_set_bool(&rc->play_requested, false);
+			stop_playing(rc);
 		}
+	}
+
+	if (os_atomic_set_bool(&rc->stop_requested, false)) {
+		os_atomic_set_bool(&rc->play_requested, false);
+		os_atomic_set_bool(&rc->autostart_requested, false);
+		stop_playing(rc);
+	}
+
+	if (os_atomic_set_bool(&rc->play_requested, false))
+		start_playing(rc, false);
+
+	if (os_atomic_set_bool(&rc->autostart_requested, false)) {
+		pthread_mutex_lock(&rc->mutex);
+		bool autostart = rc->autostart;
+		pthread_mutex_unlock(&rc->mutex);
+		if (autostart)
+			start_playing(rc, true);
+	}
+
+	/* nothing to play (empty/missing folder): end the loop instead of retrying */
+	if (os_atomic_set_bool(&rc->load_empty, false) && rc->looping) {
+		rc->looping = false;
+		blog(LOG_WARNING, "[Random Clip Player] Loop stopped: no clip could be loaded");
 	}
 
 	if (os_atomic_set_bool(&rc->pending_ready, false))
@@ -538,13 +713,27 @@ static void rc_tick(void *data, float seconds)
 	if (!os_atomic_load_bool(&rc->has_clip))
 		return;
 
-	/* Unload as soon as the clip is done */
+	/* Unload as soon as the clip is done, then queue the next one if looping */
 	obs_source_t *child = get_child_ref(rc);
-	if (child) {
-		bool done = clip_finished(rc, child);
-		obs_source_release(child);
-		if (done)
-			stop_clip(rc);
+	if (!child)
+		return;
+
+	bool done = clip_finished(rc, child);
+	obs_source_release(child);
+	if (!done)
+		return;
+
+	stop_clip(rc);
+
+	if (rc->looping) {
+		rc->loop_failures = rc->clip_played ? 0 : rc->loop_failures + 1;
+		if (rc->loop_failures >= MAX_LOOP_FAILURES) {
+			rc->looping = false;
+			blog(LOG_WARNING, "[Random Clip Player] Loop stopped: %d clips in a row failed to play",
+			     MAX_LOOP_FAILURES);
+		} else {
+			queue_load(rc);
+		}
 	}
 }
 
@@ -614,7 +803,7 @@ static void rc_enum_sources(void *data, obs_source_enum_proc_t enum_callback, vo
 }
 
 struct obs_source_info random_clip_source_info = {
-	.id = "random_clip_player",
+	.id = SOURCE_ID,
 	.type = OBS_SOURCE_TYPE_INPUT,
 	.output_flags = OBS_SOURCE_VIDEO | OBS_SOURCE_AUDIO | OBS_SOURCE_CUSTOM_DRAW | OBS_SOURCE_DO_NOT_DUPLICATE,
 	.icon_type = OBS_ICON_TYPE_MEDIA,
