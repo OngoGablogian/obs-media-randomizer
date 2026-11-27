@@ -48,6 +48,9 @@
 #define S_AUTOSTART "autostart"
 #define S_STOP_ON_SCENE "stop_on_scene_change"
 #define S_STOP_ON_HIDE "stop_on_hide"
+#define S_FADE "fade_ms"
+#define S_FADE_LOOP "fade_loop"
+#define S_FADE_SINGLE "fade_single"
 #define S_HW_DECODE "hw_decode"
 #define S_WIDTH "width"
 #define S_HEIGHT "height"
@@ -61,6 +64,9 @@
 #define REPEAT_NOT_TWICE 1 /* never the same clip twice in a row */
 #define REPEAT_SHUFFLE 2   /* every clip once before any repeats */
 #define MAX_SCAN_DEPTH 8
+#define MIN_FADE_MS 50
+#define MAX_FADE_MS 5000
+#define GAIN_SCALE 1000                        /* audio gain stored as an integer, 0..GAIN_SCALE */
 #define MAX_LOOP_FAILURES 3                    /* end a loop after this many unplayable clips in a row */
 #define START_TIMEOUT_NS (10ULL * 1000000000ULL) /* give up if a clip never starts */
 #define MIN_CLIP_AGE_NS (500ULL * 1000000ULL)    /* ignore state checks right after start */
@@ -97,11 +103,30 @@ struct random_clip {
 	bool hw_decode;
 	uint32_t cx;
 	uint32_t cy;
+	int fade_ms;
+	bool fade_loop;
+	bool fade_single;
 
 	/* graphics-thread only */
 	uint64_t clip_start_ns;
 	bool clip_played; /* current clip reached the playing state */
-	bool looping;     /* a loop session is running */
+	bool clip_fades;  /* current clip fades in/out (started by a loop) */
+	float opacity;    /* current fade level, 0..1 */
+
+	/* fade rendering, graphics thread only; the texture only exists while
+	 * a clip is loaded and has actually needed a fade frame */
+	gs_effect_t *fade_effect;
+	gs_eparam_t *fade_image;
+	gs_eparam_t *fade_opacity;
+	gs_texrender_t *texrender;
+	bool fade_effect_failed;
+
+	/* audio fade: target gain set by tick, applied by the audio callback */
+	volatile long gain;
+	float last_gain;     /* audio callback thread only */
+	float *gain_buf;     /* audio callback thread only */
+	size_t gain_buf_len; /* in floats */
+	bool looping;        /* a loop session is running */
 	int loop_failures;
 	long seen_scene_gen;
 
@@ -329,6 +354,38 @@ static void forward_audio(void *param, obs_source_t *child, const struct audio_d
 	out.samples_per_sec = rc->samples_per_sec;
 	out.timestamp = audio->timestamp;
 
+	/* Fading: scale a copy of the samples, ramping from the previous gain
+	 * to the new one across the packet so the volume changes smoothly.
+	 * At full volume the samples are passed through untouched. */
+	float gain = (float)os_atomic_load_long(&rc->gain) / (float)GAIN_SCALE;
+	float start = rc->last_gain;
+	rc->last_gain = gain;
+
+	if ((gain < 1.0f || start < 1.0f) && audio->frames) {
+		size_t channels = get_audio_channels(rc->speakers);
+		size_t frames = audio->frames;
+		size_t needed = channels * frames;
+
+		if (rc->gain_buf_len < needed) {
+			rc->gain_buf = brealloc(rc->gain_buf, needed * sizeof(float));
+			rc->gain_buf_len = needed;
+		}
+
+		float step = (gain - start) / (float)frames;
+		for (size_t ch = 0; ch < channels && ch < MAX_AV_PLANES; ch++) {
+			const float *in = (const float *)audio->data[ch];
+			float *dst = rc->gain_buf + ch * frames;
+			if (!in)
+				continue;
+			float g = start;
+			for (size_t i = 0; i < frames; i++) {
+				dst[i] = in[i] * g;
+				g += step;
+			}
+			out.data[ch] = (const uint8_t *)dst;
+		}
+	}
+
 	obs_source_output_audio(rc->source, &out);
 }
 
@@ -447,6 +504,14 @@ static void install_pending(struct random_clip *rc)
 
 	rc->clip_start_ns = os_gettime_ns();
 	rc->clip_played = false;
+
+	pthread_mutex_lock(&rc->mutex);
+	rc->clip_fades = (rc->looping ? rc->fade_loop : rc->fade_single) && rc->fade_ms > 0;
+	pthread_mutex_unlock(&rc->mutex);
+	rc->opacity = rc->clip_fades ? 0.0f : 1.0f;
+	rc->last_gain = rc->opacity; /* callback not registered yet, safe to set */
+	os_atomic_set_long(&rc->gain, rc->clip_fades ? 0 : GAIN_SCALE);
+
 	obs_source_add_audio_capture_callback(child, forward_audio, rc);
 	obs_source_add_active_child(rc->source, child);
 	os_atomic_set_bool(&rc->has_clip, true);
@@ -469,6 +534,49 @@ static bool clip_finished(struct random_clip *rc, obs_source_t *child)
 		/* never managed to start (bad/unreadable file) */
 		return age > START_TIMEOUT_NS;
 	}
+}
+
+/* Graphics thread: fade level for the current clip, from its own playback
+ * position, so the fade-out finishes exactly when the clip ends. */
+static float compute_opacity(struct random_clip *rc, obs_source_t *child)
+{
+	if (!rc->clip_fades)
+		return 1.0f;
+
+	pthread_mutex_lock(&rc->mutex);
+	int fade_ms = rc->fade_ms;
+	pthread_mutex_unlock(&rc->mutex);
+	if (fade_ms <= 0)
+		return 1.0f;
+
+	int64_t t = obs_source_media_get_time(child);
+	int64_t dur = obs_source_media_get_duration(child);
+	if (t < 0)
+		t = 0;
+
+	float level = (float)t / (float)fade_ms;
+	if (dur > 0) {
+		float out = (float)(dur - t) / (float)fade_ms;
+		if (out < level)
+			level = out;
+	}
+
+	if (level < 0.0f)
+		level = 0.0f;
+	if (level > 1.0f)
+		level = 1.0f;
+	return level;
+}
+
+/* Graphics thread: free the fade texture once no clip needs it. */
+static void free_fade_texture(struct random_clip *rc)
+{
+	if (!rc->texrender)
+		return;
+	obs_enter_graphics();
+	gs_texrender_destroy(rc->texrender);
+	obs_leave_graphics();
+	rc->texrender = NULL;
 }
 
 /* Graphics thread: queue a background load unless one is already running. */
@@ -613,6 +721,9 @@ static void rc_update(void *data, obs_data_t *settings)
 	rc->autostart = obs_data_get_bool(settings, S_AUTOSTART);
 	rc->stop_on_scene = obs_data_get_bool(settings, S_STOP_ON_SCENE);
 	rc->stop_on_hide = obs_data_get_bool(settings, S_STOP_ON_HIDE);
+	rc->fade_ms = (int)obs_data_get_int(settings, S_FADE);
+	rc->fade_loop = obs_data_get_bool(settings, S_FADE_LOOP);
+	rc->fade_single = obs_data_get_bool(settings, S_FADE_SINGLE);
 	rc->hw_decode = obs_data_get_bool(settings, S_HW_DECODE);
 	rc->cx = (uint32_t)obs_data_get_int(settings, S_WIDTH);
 	rc->cy = (uint32_t)obs_data_get_int(settings, S_HEIGHT);
@@ -624,6 +735,9 @@ static void *rc_create(obs_data_t *settings, obs_source_t *source)
 	struct random_clip *rc = bzalloc(sizeof(*rc));
 	rc->source = source;
 	rc->seen_scene_gen = os_atomic_load_long(&scene_gen);
+	rc->opacity = 1.0f;
+	rc->last_gain = 1.0f;
+	rc->gain = GAIN_SCALE;
 	rc->rng = os_gettime_ns() ^ ((uint64_t)(uintptr_t)rc << 16);
 	rng_next(&rc->rng);
 
@@ -659,6 +773,13 @@ static void rc_destroy(void *data)
 	os_task_queue_destroy(rc->loader); /* waits for any in-flight load */
 	cancel_loads(rc);
 	stop_clip(rc);
+
+	obs_enter_graphics();
+	gs_texrender_destroy(rc->texrender);
+	gs_effect_destroy(rc->fade_effect);
+	obs_leave_graphics();
+
+	bfree(rc->gain_buf);
 	bfree(rc->folder);
 	bfree(rc->last_file);
 	file_list_free(&rc->played);
@@ -679,12 +800,24 @@ static void rc_get_defaults(obs_data_t *settings)
 	obs_data_set_default_int(settings, S_REPEAT_MODE, REPEAT_SHUFFLE);
 	obs_data_set_default_bool(settings, S_INTERRUPT, true);
 	obs_data_set_default_bool(settings, S_LOOP, false);
+	obs_data_set_default_bool(settings, S_FADE_LOOP, true);
+	obs_data_set_default_bool(settings, S_FADE_SINGLE, false);
+	obs_data_set_default_int(settings, S_FADE, 500);
 	obs_data_set_default_bool(settings, S_AUTOSTART, false);
 	obs_data_set_default_bool(settings, S_STOP_ON_SCENE, true);
 	obs_data_set_default_bool(settings, S_STOP_ON_HIDE, true);
 	obs_data_set_default_bool(settings, S_HW_DECODE, false);
 	obs_data_set_default_int(settings, S_WIDTH, w);
 	obs_data_set_default_int(settings, S_HEIGHT, h);
+}
+
+/* Only show the fade duration while at least one fade toggle is on. */
+static bool fade_toggles_changed(obs_properties_t *props, obs_property_t *p, obs_data_t *settings)
+{
+	UNUSED_PARAMETER(p);
+	bool on = obs_data_get_bool(settings, S_FADE_LOOP) || obs_data_get_bool(settings, S_FADE_SINGLE);
+	obs_property_set_visible(obs_properties_get(props, S_FADE), on);
+	return true;
 }
 
 static obs_properties_t *rc_get_properties(void *data)
@@ -700,6 +833,14 @@ static obs_properties_t *rc_get_properties(void *data)
 	obs_property_list_add_int(repeat, T_("RepeatMode.Allow"), REPEAT_ALLOW);
 	obs_properties_add_bool(props, S_INTERRUPT, T_("Interrupt"));
 	obs_properties_add_bool(props, S_LOOP, T_("Loop"));
+	obs_property_t *fade_loop = obs_properties_add_bool(props, S_FADE_LOOP, T_("FadeLoop"));
+	obs_property_t *fade_single = obs_properties_add_bool(props, S_FADE_SINGLE, T_("FadeSingle"));
+	obs_property_t *fade =
+		obs_properties_add_int_slider(props, S_FADE, T_("FadeDuration"), MIN_FADE_MS, MAX_FADE_MS, 50);
+	obs_property_int_set_suffix(fade, " ms");
+	obs_property_set_long_description(fade, T_("FadeDuration.Description"));
+	obs_property_set_modified_callback(fade_loop, fade_toggles_changed);
+	obs_property_set_modified_callback(fade_single, fade_toggles_changed);
 	obs_properties_add_bool(props, S_AUTOSTART, T_("AutoStart"));
 	obs_properties_add_bool(props, S_STOP_ON_SCENE, T_("StopOnSceneChange"));
 	obs_properties_add_bool(props, S_STOP_ON_HIDE, T_("StopOnHide"));
@@ -760,8 +901,10 @@ static void rc_tick(void *data, float seconds)
 	if (os_atomic_set_bool(&rc->pending_ready, false))
 		install_pending(rc);
 
-	if (!os_atomic_load_bool(&rc->has_clip))
+	if (!os_atomic_load_bool(&rc->has_clip)) {
+		free_fade_texture(rc);
 		return;
+	}
 
 	/* Unload as soon as the clip is done, then queue the next one if looping */
 	obs_source_t *child = get_child_ref(rc);
@@ -769,6 +912,10 @@ static void rc_tick(void *data, float seconds)
 		return;
 
 	bool done = clip_finished(rc, child);
+	if (rc->clip_fades) {
+		rc->opacity = compute_opacity(rc, child);
+		os_atomic_set_long(&rc->gain, (long)(rc->opacity * (float)GAIN_SCALE + 0.5f));
+	}
 	obs_source_release(child);
 	if (!done)
 		return;
@@ -797,6 +944,77 @@ static void rc_hide(void *data)
 		os_atomic_set_bool(&rc->stop_requested, true);
 }
 
+static bool load_fade_effect(struct random_clip *rc)
+{
+	if (rc->fade_effect)
+		return true;
+	if (rc->fade_effect_failed)
+		return false;
+
+	char *file = obs_module_file("fade.effect");
+	rc->fade_effect = file ? gs_effect_create_from_file(file, NULL) : NULL;
+	bfree(file);
+
+	if (!rc->fade_effect) {
+		blog(LOG_ERROR, "[Random Clip Player] Could not load fade.effect, fades are disabled");
+		rc->fade_effect_failed = true;
+		return false;
+	}
+
+	rc->fade_image = gs_effect_get_param_by_name(rc->fade_effect, "image");
+	rc->fade_opacity = gs_effect_get_param_by_name(rc->fade_effect, "opacity");
+	return true;
+}
+
+/* Draws the clip at reduced opacity: render it into a texture, the same way
+ * OBS renders sources for its own transitions, then draw that texture with
+ * the fade shader. Only used on fade frames. */
+static void render_faded(struct random_clip *rc, obs_source_t *child, uint32_t w, uint32_t h)
+{
+	if (rc->opacity <= 0.0f)
+		return;
+	if (!load_fade_effect(rc)) {
+		obs_source_video_render(child);
+		return;
+	}
+
+	const enum gs_color_space space = gs_get_color_space();
+	const enum gs_color_format format = gs_get_format_from_space(space);
+	if (rc->texrender && gs_texrender_get_format(rc->texrender) != format) {
+		gs_texrender_destroy(rc->texrender);
+		rc->texrender = NULL;
+	}
+	if (!rc->texrender)
+		rc->texrender = gs_texrender_create(format, GS_ZS_NONE);
+
+	gs_texrender_reset(rc->texrender);
+	if (gs_texrender_begin_with_color_space(rc->texrender, w, h, space)) {
+		struct vec4 clear;
+		vec4_zero(&clear);
+		gs_clear(GS_CLEAR_COLOR, &clear, 0.0f, 0);
+		gs_ortho(0.0f, (float)w, 0.0f, (float)h, -100.0f, 100.0f);
+		obs_source_video_render(child);
+		gs_texrender_end(rc->texrender);
+	}
+
+	gs_texture_t *tex = gs_texrender_get_texture(rc->texrender);
+	if (!tex)
+		return;
+
+	const bool previous = gs_framebuffer_srgb_enabled();
+	gs_enable_framebuffer_srgb(true);
+	gs_blend_state_push();
+	gs_blend_function(GS_BLEND_ONE, GS_BLEND_INVSRCALPHA);
+
+	gs_effect_set_texture_srgb(rc->fade_image, tex);
+	gs_effect_set_float(rc->fade_opacity, rc->opacity);
+	while (gs_effect_loop(rc->fade_effect, "Draw"))
+		gs_draw_sprite(NULL, 0, w, h);
+
+	gs_blend_state_pop();
+	gs_enable_framebuffer_srgb(previous);
+}
+
 static void rc_render(void *data, gs_effect_t *effect)
 {
 	UNUSED_PARAMETER(effect);
@@ -823,7 +1041,10 @@ static void rc_render(void *data, gs_effect_t *effect)
 		gs_matrix_push();
 		gs_matrix_translate3f(((float)rc->cx - dw) * 0.5f, ((float)rc->cy - dh) * 0.5f, 0.0f);
 		gs_matrix_scale3f(scale, scale, 1.0f);
-		obs_source_video_render(child);
+		if (rc->opacity < 1.0f)
+			render_faded(rc, child, w, h);
+		else
+			obs_source_video_render(child); /* normal frames: no extra work */
 		gs_matrix_pop();
 	}
 

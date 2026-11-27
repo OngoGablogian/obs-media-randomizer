@@ -11,6 +11,7 @@ An OBS Studio source plugin that plays a random video clip from a folder when yo
 - Optionally searches subfolders
 - Shuffle mode (default) plays every clip in the folder once before any repeats, using a fast, high-quality random number generator
 - **Loop mode:** keeps playing random clips back to back, going through every clip in the folder once before any repeats, until you stop it or switch scenes
+- **Fades:** clips can fade in and out (video and audio), with separate toggles for looped and single clips and an adjustable duration
 - **Auto-start:** starts playing automatically when you switch to a scene that contains the source, and works together with loop mode
 - Stops the clip when you switch scenes by default
 - Clip audio comes through the source's own mixer channel, so volume, filters and monitoring work as normal
@@ -57,6 +58,9 @@ You can also use the **Play Random Clip** and **Stop Clip** buttons in the sourc
 | Repeats | Play every clip once before any repeat | **Play every clip once before any repeat:** shuffles through the whole folder, then starts a new round (never starting with the clip that just played). **Never the same clip twice in a row:** fully random except for back-to-back repeats. **Fully random:** any clip can play at any time |
 | Hotkey while a clip is playing starts a new clip | On | When off, presses during a clip are ignored. In loop mode this skips to the next clip |
 | Loop random clips until stopped or the scene changes | Off | Plays random clips back to back. Every clip plays once before any repeats, whatever the Repeats setting. Ends when you press **Stop Clip**, the source is hidden, or the scene changes |
+| Fade looped clips in and out | On | In loop mode, each clip fades in from transparent at its start and out at its end |
+| Fade single clips in and out | Off | Same, for clips started with the hotkey or button outside loop mode |
+| Fade duration | 500 ms | Length of each fade-in and fade-out (50–5000 ms). Video and audio fade together. Hidden while both fade toggles are off. Pressing **Stop Clip** or switching scenes still cuts immediately |
 | Start playing automatically when switching to a scene with this source | Off | Starts a clip (or a loop, if loop mode is on) when you switch to a scene where the source is visible |
 | Stop the clip when the scene changes | On | Stops the clip on any scene switch, even if the new scene also contains this source |
 | Stop the clip when the source is hidden | On | Stops the clip when the source is hidden or its scene goes out of view |
