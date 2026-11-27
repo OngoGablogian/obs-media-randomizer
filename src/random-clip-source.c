@@ -42,7 +42,7 @@
 
 #define S_FOLDER "folder"
 #define S_RECURSIVE "recursive"
-#define S_NO_REPEAT "no_repeat"
+#define S_REPEAT_MODE "repeat_mode"
 #define S_INTERRUPT "interrupt"
 #define S_LOOP "loop"
 #define S_AUTOSTART "autostart"
@@ -55,6 +55,11 @@
 #define T_(s) obs_module_text(s)
 
 #define SOURCE_ID "random_clip_player"
+
+/* repeat_mode values */
+#define REPEAT_ALLOW 0     /* fully random, repeats allowed */
+#define REPEAT_NOT_TWICE 1 /* never the same clip twice in a row */
+#define REPEAT_SHUFFLE 2   /* every clip once before any repeats */
 #define MAX_SCAN_DEPTH 8
 #define MAX_LOOP_FAILURES 3                    /* end a loop after this many unplayable clips in a row */
 #define START_TIMEOUT_NS (10ULL * 1000000000ULL) /* give up if a clip never starts */
@@ -83,7 +88,7 @@ struct random_clip {
 	struct file_list played;     /* clips played this loop round, protected by mutex */
 	char *folder;                /* protected by mutex */
 	bool recursive;
-	bool no_repeat;
+	int repeat_mode;
 	bool interrupt;
 	bool loop;
 	bool autostart;
@@ -99,6 +104,9 @@ struct random_clip {
 	bool looping;     /* a loop session is running */
 	int loop_failures;
 	long seen_scene_gen;
+
+	/* random number state, only used by this source's worker thread */
+	uint64_t rng;
 
 	/* set by graphics thread before queueing a load, read by the worker */
 	long load_gen;
@@ -192,19 +200,41 @@ static void scan_folder(const char *dir_path, bool recursive, int depth, struct 
 	os_closedir(dir);
 }
 
+/* SplitMix64: a tiny, fast, high-quality random number generator. Each
+ * source has its own state, seeded once from the clock and its address,
+ * so every source and every OBS session gets a different sequence. */
+static uint64_t rng_next(uint64_t *state)
+{
+	uint64_t z = (*state += 0x9E3779B97F4A7C15ULL);
+	z = (z ^ (z >> 30)) * 0xBF58476D1CE4E5B9ULL;
+	z = (z ^ (z >> 27)) * 0x94D049BB133111EBULL;
+	return z ^ (z >> 31);
+}
+
+/* Uniform random number in [0, n) with no modulo bias. */
+static size_t rng_below(uint64_t *state, size_t n)
+{
+	uint64_t limit = UINT64_MAX - (UINT64_MAX % (uint64_t)n);
+	uint64_t r;
+	do {
+		r = rng_next(state);
+	} while (r >= limit);
+	return (size_t)(r % (uint64_t)n);
+}
+
 static inline bool is_last(const char *path, const char *last)
 {
 	return last && strcmp(path, last) == 0;
 }
 
 /* Returns a newly allocated path, or NULL if the folder has no clips.
- * shuffle: pick only clips not yet played this loop round. */
+ * shuffle: pick only clips not yet played this round. */
 static char *pick_random_file(struct random_clip *rc, bool shuffle)
 {
 	pthread_mutex_lock(&rc->mutex);
 	char *folder = rc->folder ? bstrdup(rc->folder) : NULL;
 	bool recursive = rc->recursive;
-	bool no_repeat = rc->no_repeat;
+	bool no_repeat = rc->repeat_mode != REPEAT_ALLOW;
 	char *last = rc->last_file ? bstrdup(rc->last_file) : NULL;
 	pthread_mutex_unlock(&rc->mutex);
 
@@ -253,7 +283,7 @@ static char *pick_random_file(struct random_clip *rc, bool shuffle)
 				cand[n++] = i;
 		}
 
-		size_t idx = cand[(size_t)rand() % n];
+		size_t idx = cand[rng_below(&rc->rng, n)];
 		result = files.items[idx];
 		files.items[idx] = NULL;
 		bfree(cand);
@@ -449,7 +479,7 @@ static void queue_load(struct random_clip *rc)
 
 	pthread_mutex_lock(&rc->mutex);
 	rc->load_gen = rc->gen;
-	rc->load_shuffle = rc->looping;
+	rc->load_shuffle = rc->looping || rc->repeat_mode == REPEAT_SHUFFLE;
 	pthread_mutex_unlock(&rc->mutex);
 
 	if (!os_task_queue_queue_task(rc->loader, load_task, rc))
@@ -472,8 +502,8 @@ static void start_playing(struct random_clip *rc, bool from_autostart)
 	pthread_mutex_lock(&rc->mutex);
 	bool interrupt = rc->interrupt && !from_autostart;
 	bool loop = rc->loop;
-	if (loop && !rc->looping)
-		file_list_free(&rc->played); /* new loop session: fresh shuffle */
+	if (loop && !rc->looping && rc->repeat_mode != REPEAT_SHUFFLE)
+		file_list_free(&rc->played); /* new loop session: fresh round */
 	pthread_mutex_unlock(&rc->mutex);
 
 	if (loop && !rc->looping) {
@@ -568,11 +598,16 @@ static void rc_update(void *data, obs_data_t *settings)
 {
 	struct random_clip *rc = data;
 
+	const char *folder = obs_data_get_string(settings, S_FOLDER);
+	bool recursive = obs_data_get_bool(settings, S_RECURSIVE);
+
 	pthread_mutex_lock(&rc->mutex);
+	if (!rc->folder || strcmp(rc->folder, folder) != 0 || rc->recursive != recursive)
+		file_list_free(&rc->played); /* different clips: start a new round */
 	bfree(rc->folder);
-	rc->folder = bstrdup(obs_data_get_string(settings, S_FOLDER));
-	rc->recursive = obs_data_get_bool(settings, S_RECURSIVE);
-	rc->no_repeat = obs_data_get_bool(settings, S_NO_REPEAT);
+	rc->folder = bstrdup(folder);
+	rc->recursive = recursive;
+	rc->repeat_mode = (int)obs_data_get_int(settings, S_REPEAT_MODE);
 	rc->interrupt = obs_data_get_bool(settings, S_INTERRUPT);
 	rc->loop = obs_data_get_bool(settings, S_LOOP);
 	rc->autostart = obs_data_get_bool(settings, S_AUTOSTART);
@@ -589,6 +624,8 @@ static void *rc_create(obs_data_t *settings, obs_source_t *source)
 	struct random_clip *rc = bzalloc(sizeof(*rc));
 	rc->source = source;
 	rc->seen_scene_gen = os_atomic_load_long(&scene_gen);
+	rc->rng = os_gettime_ns() ^ ((uint64_t)(uintptr_t)rc << 16);
+	rng_next(&rc->rng);
 
 	struct obs_audio_info oai = {0};
 	if (obs_get_audio_info(&oai)) {
@@ -639,7 +676,7 @@ static void rc_get_defaults(obs_data_t *settings)
 	}
 
 	obs_data_set_default_bool(settings, S_RECURSIVE, false);
-	obs_data_set_default_bool(settings, S_NO_REPEAT, true);
+	obs_data_set_default_int(settings, S_REPEAT_MODE, REPEAT_SHUFFLE);
 	obs_data_set_default_bool(settings, S_INTERRUPT, true);
 	obs_data_set_default_bool(settings, S_LOOP, false);
 	obs_data_set_default_bool(settings, S_AUTOSTART, false);
@@ -656,7 +693,11 @@ static obs_properties_t *rc_get_properties(void *data)
 
 	obs_properties_add_path(props, S_FOLDER, T_("ClipFolder"), OBS_PATH_DIRECTORY, NULL, NULL);
 	obs_properties_add_bool(props, S_RECURSIVE, T_("IncludeSubfolders"));
-	obs_properties_add_bool(props, S_NO_REPEAT, T_("NoRepeat"));
+	obs_property_t *repeat = obs_properties_add_list(props, S_REPEAT_MODE, T_("RepeatMode"), OBS_COMBO_TYPE_LIST,
+							 OBS_COMBO_FORMAT_INT);
+	obs_property_list_add_int(repeat, T_("RepeatMode.Shuffle"), REPEAT_SHUFFLE);
+	obs_property_list_add_int(repeat, T_("RepeatMode.NotTwice"), REPEAT_NOT_TWICE);
+	obs_property_list_add_int(repeat, T_("RepeatMode.Allow"), REPEAT_ALLOW);
 	obs_properties_add_bool(props, S_INTERRUPT, T_("Interrupt"));
 	obs_properties_add_bool(props, S_LOOP, T_("Loop"));
 	obs_properties_add_bool(props, S_AUTOSTART, T_("AutoStart"));

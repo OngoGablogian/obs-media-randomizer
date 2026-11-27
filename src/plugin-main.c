@@ -1,7 +1,5 @@
 #include <obs-module.h>
 #include <obs-frontend-api.h>
-#include <util/platform.h>
-#include <stdlib.h>
 
 #include "random-clip-source.h"
 
@@ -34,7 +32,6 @@ static void frontend_event(enum obs_frontend_event event, void *param)
 
 bool obs_module_load(void)
 {
-	srand((unsigned int)os_gettime_ns());
 	obs_register_source(&random_clip_source_info);
 	obs_frontend_add_event_callback(frontend_event, NULL);
 	blog(LOG_INFO, "[Random Clip Player] loaded");
