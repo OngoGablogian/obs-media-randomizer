@@ -60,48 +60,61 @@ jobs:
         if: fromJSON(steps.check.outputs.validTag)
         id: download
 
-      - name: Rename Files
+      - name: Collect Release Files
         if: fromJSON(steps.check.outputs.validTag)
         run: |
-          : Rename Files
+          : Collect Release Files
           if [[ "${RUNNER_DEBUG}" ]]; then set -x; fi
-          shopt -s extglob
           shopt -s nullglob
 
           root_dir="$(pwd)"
-          commit_hash="${GITHUB_SHA:0:9}"
+          release_dir="${root_dir}/release-files"
+          mkdir -p "${release_dir}"
 
-          # Windows artifact is a folder in the OBS install layout: zip it once
-          for windows_dir in *-windows-x64-${commit_hash}/; do
-            windows_dir="${windows_dir%/}"
-            (cd "${windows_dir}" && zip -qr "${root_dir}/${windows_dir%-${commit_hash}}.zip" .)
+          # Only the standard packages go on the release (no debug symbols or
+          # sources), each as one zip named <plugin>-<version>-<platform>.zip,
+          # taken from its artifact folder, e.g. obs-media-randomizer-1.0.1-windows-x64.zip
+
+          # Windows: the artifact is a folder in the OBS install layout, zip it once
+          for dir in *-windows-x64/; do
+            dir="${dir%/}"
+            (cd "${dir}" && zip -qr "${release_dir}/${dir}.zip" .)
           done
 
-          variants=(
-            'macos-universal;tar.xz|pkg'
-            'ubuntu-24.04-x86_64;tar.xz|deb|ddeb'
-            'sources;tar.xz'
-          )
-
-          for variant_data in "${variants[@]}"; do
-            IFS=';' read -r variant suffix <<< "${variant_data}"
-
-            candidates=(*-${variant}-${commit_hash}/@(*|*-dbgsym).@(${suffix}))
-
-            for candidate in "${candidates[@]}"; do
-              mv "${candidate}" "${root_dir}"
+          # macOS: the .pkg installer, zipped
+          # Ubuntu: the .deb package, zipped (debug symbols are a separate artifact)
+          staging="$(mktemp -d)"
+          for pattern in '*-macos-universal/;pkg' '*-ubuntu-*-x86_64/;deb'; do
+            IFS=';' read -r dir_glob ext <<< "${pattern}"
+            for dir in ${dir_glob}; do
+              dir="${dir%/}"
+              for file in "${dir}"/*.${ext}; do
+                cp "${file}" "${staging}/${dir}.${ext}"
+                (cd "${staging}" && zip -q "${release_dir}/${dir}.zip" "${dir}.${ext}")
+              done
             done
           done
+          rm -rf "${staging}"
+
+          ls -l "${release_dir}"
+          missing=0
+          for platform in windows-x64 macos-universal 'ubuntu-*-x86_64'; do
+            files=("${release_dir}"/*-${platform}.zip)
+            if (( ${#files[@]} == 0 )); then
+              echo "::error::No ${platform} package found for the release"
+              missing=1
+            fi
+          done
+          exit ${missing}
 
       - name: Generate Checksums
         if: fromJSON(steps.check.outputs.validTag)
         run: |
           : Generate Checksums
           if [[ "${RUNNER_DEBUG}" ]]; then set -x; fi
-          shopt -s extglob
 
           echo "### Checksums" > ${{ github.workspace }}/CHECKSUMS.txt
-          for file in ${{ github.workspace }}/@(*.exe|*.deb|*.ddeb|*.pkg|*.tar.xz|*.zip); do
+          for file in ${{ github.workspace }}/release-files/*; do
             echo "    ${file##*/}: $(sha256sum "${file}" | cut -d " " -f 1)" >> ${{ github.workspace }}/CHECKSUMS.txt
           done
 
@@ -110,15 +123,10 @@ jobs:
         id: create_release
         uses: softprops/action-gh-release@8a0cd651e5b2365bd640854a3fa5dfc70e4875f3 # v3.0.4
         with:
-          draft: true
+          draft: false
           prerelease: ${{ fromJSON(steps.check.outputs.prerelease) }}
           tag_name: ${{ steps.check.outputs.version }}
           name: ${{ needs.build-project.outputs.pluginName }} ${{ steps.check.outputs.version }}
           body_path: ${{ github.workspace }}/CHECKSUMS.txt
           files: |
-            ${{ github.workspace }}/*.exe
-            ${{ github.workspace }}/*.zip
-            ${{ github.workspace }}/*.pkg
-            ${{ github.workspace }}/*.deb
-            ${{ github.workspace }}/*.ddeb
-            ${{ github.workspace }}/*.tar.xz
+            ${{ github.workspace }}/release-files/*

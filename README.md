@@ -34,9 +34,9 @@ Download the latest build for your system from the [Releases](https://github.com
 - `obs-plugins\64bit\obs-media-randomizer.dll`
 - `data\obs-plugins\obs-media-randomizer\` (locale and shader files)
 
-**macOS:** run the `.pkg` installer.
+**macOS:** extract the zip and run the `.pkg` installer inside.
 
-**Ubuntu:** install the `.deb` package.
+**Ubuntu:** extract the zip and install the `.deb` package inside.
 
 Restart OBS after installing.
 
@@ -87,7 +87,7 @@ You can also use the **Play Random File** and **Stop Playback** buttons in the s
 
 This project is based on [obs-plugintemplate](https://github.com/obsproject/obs-plugintemplate).
 
-**With GitHub Actions:** pushing to `main` builds Windows, macOS and Linux packages. You can download them from the workflow run's **Artifacts**. Pushing a version tag (for example `1.0.0`) also creates a draft release with the packages attached.
+**With GitHub Actions:** pushing to `main` builds Windows, macOS and Linux packages. You can download them from the workflow run's **Artifacts**. Pushing a version tag (for example `1.0.1`) also publishes a release with one zip per platform attached (no debug symbols or sources), named `<plugin>-<version>-<platform>.zip`.
 
 **Locally:** follow the [obs-plugintemplate build instructions](https://github.com/obsproject/obs-plugintemplate/wiki/Quick-Start-Guide) for your platform, using the presets in `CMakePresets.json`.
 
