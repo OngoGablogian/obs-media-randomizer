@@ -33,13 +33,13 @@
     },
     "platformConfig": {
         "macos": {
-            "bundleId": "com.ongogablogian.obs-random-clip"
+            "bundleId": "com.ongogablogian.obs-media-randomizer"
         }
     },
-    "name": "obs-random-clip",
-    "displayName": "OBS Random Clip",
+    "name": "obs-media-randomizer",
+    "displayName": "OBS Media Randomizer",
     "version": "1.0.0",
     "author": "Ongo",
-    "website": "https://github.com/OngoGablogian/obs-random-clip",
+    "website": "https://github.com/OngoGablogian/obs-media-randomizer",
     "email": "me@example.com"
 }

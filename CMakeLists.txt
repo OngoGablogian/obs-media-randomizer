@@ -20,6 +20,6 @@ if(ENABLE_FRONTEND_API)
   target_link_libraries(${CMAKE_PROJECT_NAME} PRIVATE OBS::obs-frontend-api)
 endif()
 
-target_sources(${CMAKE_PROJECT_NAME} PRIVATE src/plugin-main.c src/random-clip-source.c src/random-clip-source.h)
+target_sources(${CMAKE_PROJECT_NAME} PRIVATE src/plugin-main.c src/media-randomizer.c src/media-randomizer.h)
 
 set_target_properties_plugin(${CMAKE_PROJECT_NAME} PROPERTIES OUTPUT_NAME ${_name})

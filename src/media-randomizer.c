@@ -1,14 +1,14 @@
 /*
- * Random Clip Player - OBS source
+ * Media Randomizer - OBS source
  *
- * Plays a random video file from a folder when a hotkey is pressed.
- * Each clip is loaded into a temporary private "ffmpeg_source" (the same
+ * Plays a random video or audio file from a folder when a hotkey is pressed.
+ * Each file is loaded into a temporary private "ffmpeg_source" (the same
  * decoder OBS's own Media Source uses). As soon as the clip finishes, or is
  * stopped, that child source is destroyed, so no file handles, decoder
  * threads or frame buffers are held while idle.
  *
  * Optional modes:
- *  - Loop: keep playing random clips (shuffled, every clip once per round)
+ *  - Loop: keep playing random files (shuffled, every file once per round)
  *    until stopped, hidden, or the scene changes.
  *  - Auto-start: start playing when the program scene switches to a scene
  *    that shows this source.
@@ -39,7 +39,7 @@
 #include <stdlib.h>
 #include <string.h>
 
-#include "random-clip-source.h"
+#include "media-randomizer.h"
 
 #define S_FOLDER "folder"
 #define S_RECURSIVE "recursive"
@@ -55,13 +55,19 @@
 #define S_NORMALIZE "normalize"
 #define S_NORM_TARGET "normalize_target"
 #define S_NORM_MAX_BOOST "normalize_max_boost"
+#define S_MEDIA_TYPES "media_types"
 #define S_HW_DECODE "hw_decode"
 #define S_WIDTH "width"
 #define S_HEIGHT "height"
 
 #define T_(s) obs_module_text(s)
 
-#define SOURCE_ID "random_clip_player"
+#define SOURCE_ID "media_randomizer"
+
+/* media_types values */
+#define MEDIA_ALL 0
+#define MEDIA_VIDEO 1
+#define MEDIA_AUDIO 2
 
 /* repeat_mode values */
 #define REPEAT_ALLOW 0     /* fully random, repeats allowed */
@@ -87,6 +93,9 @@
 static const char *video_exts[] = {".mp4", ".mkv", ".mov",  ".webm", ".avi",  ".flv", ".m4v",
 				   ".ts",  ".mts", ".m2ts", ".mpg",  ".mpeg", ".wmv", ".gif"};
 
+static const char *audio_exts[] = {".mp3", ".flac", ".wav", ".ogg", ".oga", ".opus",
+				   ".m4a", ".aac",  ".wma", ".aif", ".aiff"};
+
 /* Bumped by the frontend whenever the program scene changes. */
 static volatile long scene_gen = 0;
 
@@ -96,7 +105,7 @@ struct file_list {
 	size_t cap;
 };
 
-struct random_clip {
+struct media_randomizer {
 	obs_source_t *source;
 
 	pthread_mutex_t mutex;
@@ -108,6 +117,7 @@ struct random_clip {
 	char *folder;                /* protected by mutex */
 	bool recursive;
 	int repeat_mode;
+	int media_types;
 	bool interrupt;
 	bool loop;
 	bool autostart;
@@ -124,6 +134,7 @@ struct random_clip {
 	uint64_t clip_start_ns;
 	bool clip_played; /* current clip reached the playing state */
 	bool clip_fades;  /* current clip fades in/out (started by a loop) */
+	bool clip_audio;  /* current file is audio-only: nothing to draw */
 	float opacity;    /* current fade level, 0..1 */
 
 	/* fade rendering, graphics thread only; the texture only exists while
@@ -208,19 +219,33 @@ static bool file_list_contains(const struct file_list *list, const char *path)
 	return false;
 }
 
-static bool is_video_file(const char *name)
+static bool has_ext(const char *name, const char **exts, size_t count)
 {
 	const char *ext = os_get_path_extension(name);
 	if (!ext)
 		return false;
-	for (size_t i = 0; i < sizeof(video_exts) / sizeof(video_exts[0]); i++) {
-		if (astrcmpi(ext, video_exts[i]) == 0)
+	for (size_t i = 0; i < count; i++) {
+		if (astrcmpi(ext, exts[i]) == 0)
 			return true;
 	}
 	return false;
 }
 
-static void scan_folder(const char *dir_path, bool recursive, int depth, struct file_list *out)
+static bool is_audio_file(const char *name)
+{
+	return has_ext(name, audio_exts, sizeof(audio_exts) / sizeof(audio_exts[0]));
+}
+
+static bool is_media_file(const char *name, int types)
+{
+	if (types != MEDIA_AUDIO && has_ext(name, video_exts, sizeof(video_exts) / sizeof(video_exts[0])))
+		return true;
+	if (types != MEDIA_VIDEO && is_audio_file(name))
+		return true;
+	return false;
+}
+
+static void scan_folder(const char *dir_path, bool recursive, int types, int depth, struct file_list *out)
 {
 	os_dir_t *dir = os_opendir(dir_path);
 	if (!dir)
@@ -228,7 +253,9 @@ static void scan_folder(const char *dir_path, bool recursive, int depth, struct 
 
 	struct os_dirent *ent;
 	while ((ent = os_readdir(dir)) != NULL) {
-		if (strcmp(ent->d_name, ".") == 0 || strcmp(ent->d_name, "..") == 0)
+		/* skip ".", "..", and hidden files such as the "._name" metadata
+		 * files macOS leaves on shared drives, which aren't playable */
+		if (ent->d_name[0] == '.')
 			continue;
 
 		struct dstr path = {0};
@@ -236,9 +263,9 @@ static void scan_folder(const char *dir_path, bool recursive, int depth, struct 
 
 		if (ent->directory) {
 			if (recursive && depth < MAX_SCAN_DEPTH)
-				scan_folder(path.array, recursive, depth + 1, out);
+				scan_folder(path.array, recursive, types, depth + 1, out);
 			dstr_free(&path);
-		} else if (is_video_file(ent->d_name)) {
+		} else if (is_media_file(ent->d_name, types)) {
 			file_list_push(out, path.array); /* takes ownership */
 		} else {
 			dstr_free(&path);
@@ -277,28 +304,29 @@ static inline bool is_last(const char *path, const char *last)
 
 /* Returns a newly allocated path, or NULL if the folder has no clips.
  * shuffle: pick only clips not yet played this round. */
-static char *pick_random_file(struct random_clip *rc, bool shuffle)
+static char *pick_random_file(struct media_randomizer *rc, bool shuffle)
 {
 	pthread_mutex_lock(&rc->mutex);
 	char *folder = rc->folder ? bstrdup(rc->folder) : NULL;
 	bool recursive = rc->recursive;
 	bool no_repeat = rc->repeat_mode != REPEAT_ALLOW;
 	char *last = rc->last_file ? bstrdup(rc->last_file) : NULL;
+	int types = rc->media_types;
 	pthread_mutex_unlock(&rc->mutex);
 
 	if (!folder || !*folder) {
-		blog(LOG_WARNING, "[Random Clip Player] No folder selected");
+		blog(LOG_WARNING, "[Media Randomizer] No folder selected");
 		bfree(folder);
 		bfree(last);
 		return NULL;
 	}
 
 	struct file_list files = {0};
-	scan_folder(folder, recursive, 0, &files);
+	scan_folder(folder, recursive, types, 0, &files);
 
 	char *result = NULL;
 	if (files.num == 0) {
-		blog(LOG_WARNING, "[Random Clip Player] No video files found in '%s'", folder);
+		blog(LOG_WARNING, "[Media Randomizer] No media files found in '%s'", folder);
 	} else {
 		size_t *cand = bmalloc(files.num * sizeof(size_t));
 		size_t n = 0;
@@ -352,7 +380,7 @@ static char *pick_random_file(struct random_clip *rc, bool shuffle)
 /* ------------------------------------------------------------------------- */
 /* Child (clip) management                                                   */
 
-static obs_source_t *get_child_ref(struct random_clip *rc)
+static obs_source_t *get_child_ref(struct media_randomizer *rc)
 {
 	pthread_mutex_lock(&rc->mutex);
 	obs_source_t *child = rc->child ? obs_source_get_ref(rc->child) : NULL;
@@ -368,7 +396,8 @@ static obs_source_t *get_child_ref(struct random_clip *rc)
  * drifts slowly, so the clip's own dynamics are kept. It is capped at
  * +/-12 dB and lowered for any packet whose peaks would exceed about -1 dBFS.
  * Returns the normalization gain for this packet. */
-static float update_normalization(struct random_clip *rc, const struct audio_data *audio, size_t channels, float fade)
+static float update_normalization(struct media_randomizer *rc, const struct audio_data *audio, size_t channels,
+				  float fade)
 {
 	size_t frames = audio->frames;
 	double sumsq = 0.0;
@@ -441,7 +470,7 @@ static float update_normalization(struct random_clip *rc, const struct audio_dat
 			pthread_mutex_lock(&rc->mutex);
 			const char *name = rc->last_file ? rc->last_file : "";
 			const char *slash = strrchr(name, '/');
-			blog(LOG_INFO, "[Random Clip Player] Normalizing '%s': level %.1f dB, gain %+.1f dB%s",
+			blog(LOG_INFO, "[Media Randomizer] Normalizing '%s': level %.1f dB, gain %+.1f dB%s",
 			     slash ? slash + 1 : name, 20.0f * log10f(level), 20.0f * log10f(desired),
 			     capped ? " (at maximum boost)" : "");
 			pthread_mutex_unlock(&rc->mutex);
@@ -462,7 +491,7 @@ static void forward_audio(void *param, obs_source_t *child, const struct audio_d
 {
 	UNUSED_PARAMETER(child);
 	UNUSED_PARAMETER(muted);
-	struct random_clip *rc = param;
+	struct media_randomizer *rc = param;
 
 	struct obs_source_audio out = {0};
 	for (size_t i = 0; i < MAX_AV_PLANES; i++)
@@ -518,7 +547,7 @@ static void forward_audio(void *param, obs_source_t *child, const struct audio_d
 	obs_source_output_audio(rc->source, &out);
 }
 
-static void stop_clip(struct random_clip *rc)
+static void stop_clip(struct media_randomizer *rc)
 {
 	pthread_mutex_lock(&rc->mutex);
 	obs_source_t *child = rc->child;
@@ -536,7 +565,7 @@ static void stop_clip(struct random_clip *rc)
 /* Background worker: scan the folder, pick a clip and create its decoder. */
 static void load_task(void *param)
 {
-	struct random_clip *rc = param;
+	struct media_randomizer *rc = param;
 	long gen = rc->load_gen;
 	bool shuffle = rc->load_shuffle;
 
@@ -559,11 +588,11 @@ static void load_task(void *param)
 		obs_data_set_bool(settings, "hw_decode", hw_decode);
 		obs_data_set_int(settings, "speed_percent", 100);
 
-		child = obs_source_create_private("ffmpeg_source", "Random Clip Player (clip)", settings);
+		child = obs_source_create_private("ffmpeg_source", "Media Randomizer (file)", settings);
 		obs_data_release(settings);
 
 		if (!child)
-			blog(LOG_ERROR, "[Random Clip Player] Failed to create media source for '%s'", path);
+			blog(LOG_ERROR, "[Media Randomizer] Failed to create media source for '%s'", path);
 	}
 
 	if (child) {
@@ -591,7 +620,7 @@ static void load_task(void *param)
 }
 
 /* Cancels any in-flight load and drops a loaded-but-not-yet-shown clip. */
-static void cancel_loads(struct random_clip *rc)
+static void cancel_loads(struct media_randomizer *rc)
 {
 	pthread_mutex_lock(&rc->mutex);
 	rc->gen++;
@@ -607,7 +636,7 @@ static void cancel_loads(struct random_clip *rc)
 }
 
 /* Graphics thread: swap in the clip the worker loaded. */
-static void install_pending(struct random_clip *rc)
+static void install_pending(struct media_randomizer *rc)
 {
 	pthread_mutex_lock(&rc->mutex);
 	obs_source_t *child = rc->pending_child;
@@ -623,7 +652,7 @@ static void install_pending(struct random_clip *rc)
 
 	stop_clip(rc);
 
-	blog(LOG_INFO, "[Random Clip Player] Playing '%s'", path);
+	blog(LOG_INFO, "[Media Randomizer] Playing '%s'", path);
 
 	pthread_mutex_lock(&rc->mutex);
 	bfree(rc->last_file);
@@ -636,6 +665,7 @@ static void install_pending(struct random_clip *rc)
 
 	pthread_mutex_lock(&rc->mutex);
 	rc->clip_fades = (rc->looping ? rc->fade_loop : rc->fade_single) && rc->fade_ms > 0;
+	rc->clip_audio = is_audio_file(path);
 	pthread_mutex_unlock(&rc->mutex);
 	rc->opacity = rc->clip_fades ? 0.0f : 1.0f;
 	rc->last_gain = rc->opacity; /* callback not registered yet, safe to set */
@@ -650,7 +680,7 @@ static void install_pending(struct random_clip *rc)
 	os_atomic_set_bool(&rc->has_clip, true);
 }
 
-static bool clip_finished(struct random_clip *rc, obs_source_t *child)
+static bool clip_finished(struct media_randomizer *rc, obs_source_t *child)
 {
 	uint64_t age = os_gettime_ns() - rc->clip_start_ns;
 
@@ -671,7 +701,7 @@ static bool clip_finished(struct random_clip *rc, obs_source_t *child)
 
 /* Graphics thread: fade level for the current clip, from its own playback
  * position, so the fade-out finishes exactly when the clip ends. */
-static float compute_opacity(struct random_clip *rc, obs_source_t *child)
+static float compute_opacity(struct media_randomizer *rc, obs_source_t *child)
 {
 	if (!rc->clip_fades)
 		return 1.0f;
@@ -702,7 +732,7 @@ static float compute_opacity(struct random_clip *rc, obs_source_t *child)
 }
 
 /* Graphics thread: free the fade texture once no clip needs it. */
-static void free_fade_texture(struct random_clip *rc)
+static void free_fade_texture(struct media_randomizer *rc)
 {
 	if (!rc->texrender)
 		return;
@@ -713,7 +743,7 @@ static void free_fade_texture(struct random_clip *rc)
 }
 
 /* Graphics thread: queue a background load unless one is already running. */
-static void queue_load(struct random_clip *rc)
+static void queue_load(struct media_randomizer *rc)
 {
 	if (!rc->loader || os_atomic_set_bool(&rc->loading, true))
 		return;
@@ -729,13 +759,13 @@ static void queue_load(struct random_clip *rc)
 
 /* Graphics thread: handle a play request (hotkey, button or auto-start).
  * Auto-start never interrupts a clip that is already playing. */
-static void start_playing(struct random_clip *rc, bool from_autostart)
+static void start_playing(struct media_randomizer *rc, bool from_autostart)
 {
 	/* Never start a clip nobody can see. Otherwise a hotkey shared by
 	 * several sources starts clips in scenes that aren't on screen, and
 	 * those clips appear mid-transition when switching to that scene. */
 	if (!obs_source_showing(rc->source)) {
-		blog(LOG_INFO, "[Random Clip Player] '%s' is not visible, ignoring play request",
+		blog(LOG_INFO, "[Media Randomizer] '%s' is not visible, ignoring play request",
 		     obs_source_get_name(rc->source));
 		return;
 	}
@@ -756,7 +786,7 @@ static void start_playing(struct random_clip *rc, bool from_autostart)
 		queue_load(rc);
 }
 
-static void stop_playing(struct random_clip *rc)
+static void stop_playing(struct media_randomizer *rc)
 {
 	rc->looping = false;
 	cancel_loads(rc);
@@ -766,12 +796,12 @@ static void stop_playing(struct random_clip *rc)
 /* ------------------------------------------------------------------------- */
 /* Frontend hooks (called from plugin-main.c on the UI thread)                */
 
-void random_clip_scene_changed(void)
+void media_randomizer_scene_changed(void)
 {
 	os_atomic_inc_long(&scene_gen);
 }
 
-void random_clip_mark_autostart(obs_source_t *parent, obs_source_t *child, void *param)
+void media_randomizer_mark_autostart(obs_source_t *parent, obs_source_t *child, void *param)
 {
 	UNUSED_PARAMETER(parent);
 	UNUSED_PARAMETER(param);
@@ -780,7 +810,7 @@ void random_clip_mark_autostart(obs_source_t *parent, obs_source_t *child, void 
 	if (!id || strcmp(id, SOURCE_ID) != 0)
 		return;
 
-	struct random_clip *rc = obs_obj_get_data(child);
+	struct media_randomizer *rc = obs_obj_get_data(child);
 	if (rc)
 		os_atomic_set_bool(&rc->autostart_requested, true);
 }
@@ -792,7 +822,7 @@ static void play_hotkey_cb(void *data, obs_hotkey_id id, obs_hotkey_t *hotkey, b
 {
 	UNUSED_PARAMETER(id);
 	UNUSED_PARAMETER(hotkey);
-	struct random_clip *rc = data;
+	struct media_randomizer *rc = data;
 	if (pressed)
 		os_atomic_set_bool(&rc->play_requested, true);
 }
@@ -801,7 +831,7 @@ static void stop_hotkey_cb(void *data, obs_hotkey_id id, obs_hotkey_t *hotkey, b
 {
 	UNUSED_PARAMETER(id);
 	UNUSED_PARAMETER(hotkey);
-	struct random_clip *rc = data;
+	struct media_randomizer *rc = data;
 	if (pressed)
 		os_atomic_set_bool(&rc->stop_requested, true);
 }
@@ -810,7 +840,7 @@ static bool play_button_cb(obs_properties_t *props, obs_property_t *p, void *dat
 {
 	UNUSED_PARAMETER(props);
 	UNUSED_PARAMETER(p);
-	struct random_clip *rc = data;
+	struct media_randomizer *rc = data;
 	if (rc)
 		os_atomic_set_bool(&rc->play_requested, true);
 	return false;
@@ -820,7 +850,7 @@ static bool stop_button_cb(obs_properties_t *props, obs_property_t *p, void *dat
 {
 	UNUSED_PARAMETER(props);
 	UNUSED_PARAMETER(p);
-	struct random_clip *rc = data;
+	struct media_randomizer *rc = data;
 	if (rc)
 		os_atomic_set_bool(&rc->stop_requested, true);
 	return false;
@@ -832,12 +862,12 @@ static bool stop_button_cb(obs_properties_t *props, obs_property_t *p, void *dat
 static const char *rc_get_name(void *unused)
 {
 	UNUSED_PARAMETER(unused);
-	return T_("RandomClipPlayer");
+	return T_("MediaRandomizer");
 }
 
 static void rc_update(void *data, obs_data_t *settings)
 {
-	struct random_clip *rc = data;
+	struct media_randomizer *rc = data;
 
 	const char *folder = obs_data_get_string(settings, S_FOLDER);
 	bool recursive = obs_data_get_bool(settings, S_RECURSIVE);
@@ -849,6 +879,10 @@ static void rc_update(void *data, obs_data_t *settings)
 	rc->folder = bstrdup(folder);
 	rc->recursive = recursive;
 	rc->repeat_mode = (int)obs_data_get_int(settings, S_REPEAT_MODE);
+	int types = (int)obs_data_get_int(settings, S_MEDIA_TYPES);
+	if (types != rc->media_types)
+		file_list_free(&rc->played); /* different files: start a new round */
+	rc->media_types = types;
 	rc->interrupt = obs_data_get_bool(settings, S_INTERRUPT);
 	rc->loop = obs_data_get_bool(settings, S_LOOP);
 	rc->autostart = obs_data_get_bool(settings, S_AUTOSTART);
@@ -868,7 +902,7 @@ static void rc_update(void *data, obs_data_t *settings)
 
 static void *rc_create(obs_data_t *settings, obs_source_t *source)
 {
-	struct random_clip *rc = bzalloc(sizeof(*rc));
+	struct media_randomizer *rc = bzalloc(sizeof(*rc));
 	rc->source = source;
 	rc->seen_scene_gen = os_atomic_load_long(&scene_gen);
 	rc->opacity = 1.0f;
@@ -895,9 +929,8 @@ static void *rc_create(obs_data_t *settings, obs_source_t *source)
 	rc->loader = os_task_queue_create();
 
 	rc->play_hotkey =
-		obs_hotkey_register_source(source, "RandomClipPlayer.Play", T_("PlayRandomClip"), play_hotkey_cb, rc);
-	rc->stop_hotkey =
-		obs_hotkey_register_source(source, "RandomClipPlayer.Stop", T_("StopClip"), stop_hotkey_cb, rc);
+		obs_hotkey_register_source(source, "MediaRandomizer.Play", T_("PlayRandom"), play_hotkey_cb, rc);
+	rc->stop_hotkey = obs_hotkey_register_source(source, "MediaRandomizer.Stop", T_("Stop"), stop_hotkey_cb, rc);
 
 	rc_update(rc, settings);
 	return rc;
@@ -905,7 +938,7 @@ static void *rc_create(obs_data_t *settings, obs_source_t *source)
 
 static void rc_destroy(void *data)
 {
-	struct random_clip *rc = data;
+	struct media_randomizer *rc = data;
 	cancel_loads(rc);
 	os_task_queue_destroy(rc->loader); /* waits for any in-flight load */
 	cancel_loads(rc);
@@ -935,6 +968,7 @@ static void rc_get_defaults(obs_data_t *settings)
 
 	obs_data_set_default_bool(settings, S_RECURSIVE, false);
 	obs_data_set_default_int(settings, S_REPEAT_MODE, REPEAT_SHUFFLE);
+	obs_data_set_default_int(settings, S_MEDIA_TYPES, MEDIA_ALL);
 	obs_data_set_default_bool(settings, S_INTERRUPT, true);
 	obs_data_set_default_bool(settings, S_LOOP, false);
 	obs_data_set_default_bool(settings, S_FADE_LOOP, true);
@@ -974,8 +1008,13 @@ static obs_properties_t *rc_get_properties(void *data)
 {
 	obs_properties_t *props = obs_properties_create();
 
-	obs_properties_add_path(props, S_FOLDER, T_("ClipFolder"), OBS_PATH_DIRECTORY, NULL, NULL);
+	obs_properties_add_path(props, S_FOLDER, T_("MediaFolder"), OBS_PATH_DIRECTORY, NULL, NULL);
 	obs_properties_add_bool(props, S_RECURSIVE, T_("IncludeSubfolders"));
+	obs_property_t *types = obs_properties_add_list(props, S_MEDIA_TYPES, T_("MediaTypes"), OBS_COMBO_TYPE_LIST,
+							OBS_COMBO_FORMAT_INT);
+	obs_property_list_add_int(types, T_("MediaTypes.All"), MEDIA_ALL);
+	obs_property_list_add_int(types, T_("MediaTypes.Video"), MEDIA_VIDEO);
+	obs_property_list_add_int(types, T_("MediaTypes.Audio"), MEDIA_AUDIO);
 	obs_property_t *repeat = obs_properties_add_list(props, S_REPEAT_MODE, T_("RepeatMode"), OBS_COMBO_TYPE_LIST,
 							 OBS_COMBO_FORMAT_INT);
 	obs_property_list_add_int(repeat, T_("RepeatMode.Shuffle"), REPEAT_SHUFFLE);
@@ -1007,8 +1046,8 @@ static obs_properties_t *rc_get_properties(void *data)
 	obs_properties_add_bool(props, S_HW_DECODE, T_("HardwareDecode"));
 	obs_properties_add_int(props, S_WIDTH, T_("Width"), 1, 16384, 1);
 	obs_properties_add_int(props, S_HEIGHT, T_("Height"), 1, 16384, 1);
-	obs_properties_add_button2(props, "play_now", T_("PlayRandomClip"), play_button_cb, data);
-	obs_properties_add_button2(props, "stop_now", T_("StopClip"), stop_button_cb, data);
+	obs_properties_add_button2(props, "play_now", T_("PlayRandom"), play_button_cb, data);
+	obs_properties_add_button2(props, "stop_now", T_("Stop"), stop_button_cb, data);
 
 	return props;
 }
@@ -1016,7 +1055,7 @@ static obs_properties_t *rc_get_properties(void *data)
 static void rc_tick(void *data, float seconds)
 {
 	UNUSED_PARAMETER(seconds);
-	struct random_clip *rc = data;
+	struct media_randomizer *rc = data;
 
 	/* Program scene changed: a loop session always ends here; the current
 	 * clip stops too unless "stop on scene change" is turned off. */
@@ -1055,7 +1094,7 @@ static void rc_tick(void *data, float seconds)
 	/* nothing to play (empty/missing folder): end the loop instead of retrying */
 	if (os_atomic_set_bool(&rc->load_empty, false) && rc->looping) {
 		rc->looping = false;
-		blog(LOG_WARNING, "[Random Clip Player] Loop stopped: no clip could be loaded");
+		blog(LOG_WARNING, "[Media Randomizer] Loop stopped: no file could be loaded");
 	}
 
 	if (os_atomic_set_bool(&rc->pending_ready, false))
@@ -1086,7 +1125,7 @@ static void rc_tick(void *data, float seconds)
 		rc->loop_failures = rc->clip_played ? 0 : rc->loop_failures + 1;
 		if (rc->loop_failures >= MAX_LOOP_FAILURES) {
 			rc->looping = false;
-			blog(LOG_WARNING, "[Random Clip Player] Loop stopped: %d clips in a row failed to play",
+			blog(LOG_WARNING, "[Media Randomizer] Loop stopped: %d files in a row failed to play",
 			     MAX_LOOP_FAILURES);
 		} else {
 			queue_load(rc);
@@ -1096,7 +1135,7 @@ static void rc_tick(void *data, float seconds)
 
 static void rc_hide(void *data)
 {
-	struct random_clip *rc = data;
+	struct media_randomizer *rc = data;
 	pthread_mutex_lock(&rc->mutex);
 	bool stop = rc->stop_on_hide;
 	pthread_mutex_unlock(&rc->mutex);
@@ -1104,7 +1143,7 @@ static void rc_hide(void *data)
 		os_atomic_set_bool(&rc->stop_requested, true);
 }
 
-static bool load_fade_effect(struct random_clip *rc)
+static bool load_fade_effect(struct media_randomizer *rc)
 {
 	if (rc->fade_effect)
 		return true;
@@ -1116,7 +1155,7 @@ static bool load_fade_effect(struct random_clip *rc)
 	bfree(file);
 
 	if (!rc->fade_effect) {
-		blog(LOG_ERROR, "[Random Clip Player] Could not load fade.effect, fades are disabled");
+		blog(LOG_ERROR, "[Media Randomizer] Could not load fade.effect, fades are disabled");
 		rc->fade_effect_failed = true;
 		return false;
 	}
@@ -1129,7 +1168,7 @@ static bool load_fade_effect(struct random_clip *rc)
 /* Draws the clip at reduced opacity: render it into a texture, the same way
  * OBS renders sources for its own transitions, then draw that texture with
  * the fade shader. Only used on fade frames. */
-static void render_faded(struct random_clip *rc, obs_source_t *child, uint32_t w, uint32_t h)
+static void render_faded(struct media_randomizer *rc, obs_source_t *child, uint32_t w, uint32_t h)
 {
 	if (rc->opacity <= 0.0f)
 		return;
@@ -1178,9 +1217,10 @@ static void render_faded(struct random_clip *rc, obs_source_t *child, uint32_t w
 static void rc_render(void *data, gs_effect_t *effect)
 {
 	UNUSED_PARAMETER(effect);
-	struct random_clip *rc = data;
+	struct media_randomizer *rc = data;
 
-	if (!os_atomic_load_bool(&rc->has_clip))
+	/* audio files: nothing to draw (this also hides embedded album art) */
+	if (!os_atomic_load_bool(&rc->has_clip) || rc->clip_audio)
 		return;
 
 	obs_source_t *child = get_child_ref(rc);
@@ -1213,19 +1253,19 @@ static void rc_render(void *data, gs_effect_t *effect)
 
 static uint32_t rc_get_width(void *data)
 {
-	struct random_clip *rc = data;
+	struct media_randomizer *rc = data;
 	return rc->cx;
 }
 
 static uint32_t rc_get_height(void *data)
 {
-	struct random_clip *rc = data;
+	struct media_randomizer *rc = data;
 	return rc->cy;
 }
 
 static void rc_enum_sources(void *data, obs_source_enum_proc_t enum_callback, void *param)
 {
-	struct random_clip *rc = data;
+	struct media_randomizer *rc = data;
 	obs_source_t *child = get_child_ref(rc);
 	if (child) {
 		enum_callback(rc->source, child, param);
@@ -1233,7 +1273,7 @@ static void rc_enum_sources(void *data, obs_source_enum_proc_t enum_callback, vo
 	}
 }
 
-struct obs_source_info random_clip_source_info = {
+struct obs_source_info media_randomizer_source_info = {
 	.id = SOURCE_ID,
 	.type = OBS_SOURCE_TYPE_INPUT,
 	.output_flags = OBS_SOURCE_VIDEO | OBS_SOURCE_AUDIO | OBS_SOURCE_CUSTOM_DRAW | OBS_SOURCE_DO_NOT_DUPLICATE,
