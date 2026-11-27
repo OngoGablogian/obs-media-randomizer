@@ -86,6 +86,8 @@
 #define NORM_FAST_TAU 0.3f                     /* seconds, while a clip's level is first measured */
 #define NORM_SLOW_TAU 2.0f                     /* seconds, afterwards */
 #define NORM_FAST_SECONDS 1.0f                 /* how long the fast phase lasts */
+#define NORM_DOWN_TAU 0.3f                     /* seconds, turning gain down (always fast) */
+#define NORM_LOG_SECONDS 5.0f                  /* report the level after this much audio */
 #define MAX_LOOP_FAILURES 3                    /* end a loop after this many unplayable clips in a row */
 #define START_TIMEOUT_NS (10ULL * 1000000000ULL) /* give up if a clip never starts */
 #define MIN_CLIP_AGE_NS (500ULL * 1000000ULL)    /* ignore state checks right after start */
@@ -334,12 +336,15 @@ static char *pick_random_file(struct media_randomizer *rc, bool shuffle)
 		if (shuffle) {
 			pthread_mutex_lock(&rc->mutex);
 			for (size_t i = 0; i < files.num; i++) {
-				if (!file_list_contains(&rc->played, files.items[i]))
+				/* not yet played this round, and never the file that just
+				 * played (a new loop session starts a fresh round) */
+				if (!file_list_contains(&rc->played, files.items[i]) &&
+				    (files.num == 1 || !is_last(files.items[i], last)))
 					cand[n++] = i;
 			}
 			if (n == 0) {
-				/* every clip has played: start a new round, but never
-				 * repeat the clip that just finished */
+				/* every file has played: start a new round, but never
+				 * repeat the file that just finished */
 				file_list_free(&rc->played);
 				for (size_t i = 0; i < files.num; i++) {
 					if (files.num == 1 || !is_last(files.items[i], last))
@@ -418,6 +423,7 @@ static float update_normalization(struct media_randomizer *rc, const struct audi
 
 	/* Record this packet's level (in dB) in a small histogram. */
 	double mean_square = sumsq / (double)(channels * frames);
+
 	if (mean_square > 0.0) {
 		double packet_db = 10.0 * log10(mean_square);
 		if (packet_db > (double)NORM_FLOOR_DB) {
@@ -464,8 +470,8 @@ static float update_normalization(struct media_randomizer *rc, const struct audi
 
 		float measured_s = (float)rc->norm_frames / (float)rc->samples_per_sec;
 
-		/* report once per clip, after the first second of measured audio */
-		if (!rc->norm_logged && measured_s >= NORM_FAST_SECONDS) {
+		/* report once per file, after a few seconds of measured audio */
+		if (!rc->norm_logged && measured_s >= NORM_LOG_SECONDS) {
 			rc->norm_logged = true;
 			pthread_mutex_lock(&rc->mutex);
 			const char *name = rc->last_file ? rc->last_file : "";
@@ -476,7 +482,14 @@ static float update_normalization(struct media_randomizer *rc, const struct audi
 			pthread_mutex_unlock(&rc->mutex);
 		}
 
-		float tau = measured_s < NORM_FAST_SECONDS ? NORM_FAST_TAU : NORM_SLOW_TAU;
+		/* Turning down is always fast, so a loud section after a quiet intro
+		 * is pulled back quickly. Turning up is fast only while a file is
+		 * first measured, then slow, so quiet passages aren't pumped up. */
+		float tau;
+		if (desired < rc->norm_gain)
+			tau = NORM_DOWN_TAU;
+		else
+			tau = measured_s < NORM_FAST_SECONDS ? NORM_FAST_TAU : NORM_SLOW_TAU;
 		float alpha = 1.0f - expf(-(float)frames / (tau * (float)rc->samples_per_sec));
 		rc->norm_gain += (desired - rc->norm_gain) * alpha;
 	}
