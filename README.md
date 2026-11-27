@@ -43,6 +43,8 @@ Restart OBS after installing.
 3. Go to **File → Settings → Hotkeys**, find your source by name, and set a key for **Play Random Clip**. You can also set one for **Stop Clip**.
 4. Press the hotkey to play a random clip.
 
+The hotkey only plays a clip while the source is visible (on screen, in the studio mode preview, or in its properties window). If several Random Clip Player sources share the same hotkey, only the visible ones play.
+
 You can also use the **Play Random Clip** and **Stop Clip** buttons in the source's properties to test it.
 
 ## Settings

@@ -460,6 +460,15 @@ static void queue_load(struct random_clip *rc)
  * Auto-start never interrupts a clip that is already playing. */
 static void start_playing(struct random_clip *rc, bool from_autostart)
 {
+	/* Never start a clip nobody can see. Otherwise a hotkey shared by
+	 * several sources starts clips in scenes that aren't on screen, and
+	 * those clips appear mid-transition when switching to that scene. */
+	if (!obs_source_showing(rc->source)) {
+		blog(LOG_INFO, "[Random Clip Player] '%s' is not visible, ignoring play request",
+		     obs_source_get_name(rc->source));
+		return;
+	}
+
 	pthread_mutex_lock(&rc->mutex);
 	bool interrupt = rc->interrupt && !from_autostart;
 	bool loop = rc->loop;
