@@ -14,6 +14,7 @@ An OBS Studio source plugin that plays a random video clip from a folder when yo
 - **Fades:** clips can fade in and out (video and audio), with separate toggles for looped and single clips and an adjustable duration
 - **Auto-start:** starts playing automatically when you switch to a scene that contains the source, and works together with loop mode
 - Stops the clip when you switch scenes by default
+- Optional audio normalization evens out volume differences between clips, measured on the fly with no extra decoding
 - Clip audio comes through the source's own mixer channel, so volume, filters and monitoring work as normal
 - Clips are scaled to fit the source and centered, so the source's size and position in the scene stay the same between clips
 - Lightweight: folder scanning and clip loading happen off OBS's render thread, only one clip is ever loaded at a time (even when looping), and the plugin does almost nothing while idle
@@ -64,6 +65,8 @@ You can also use the **Play Random Clip** and **Stop Clip** buttons in the sourc
 | Start playing automatically when switching to a scene with this source | Off | Starts a clip (or a loop, if loop mode is on) when you switch to a scene where the source is visible |
 | Stop the clip when the scene changes | On | Stops the clip on any scene switch, even if the new scene also contains this source |
 | Stop the clip when the source is hidden | On | Stops the clip when the source is hidden or its scene goes out of view |
+| Normalize audio levels between clips | Off | Measures each clip's average level while it plays and brings it toward the target, so loud and quiet clips end up at a similar volume. Changes are capped at 12 dB up or down, and peaks are kept under about -1 dBFS. It takes about half a second to measure each new clip, then only adjusts slowly, so the clip's own loud and quiet moments are kept |
+| Target level | -20 dB | Average level clips are brought toward when normalization is on (-30 to -10 dB). Shown only while normalization is on |
 | Use hardware decoding when available | Off | Decodes clips on the GPU instead of the CPU |
 | Width / Height | Canvas size | Size of the source. Clips are scaled to fit and centered |
 

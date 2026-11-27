@@ -35,6 +35,7 @@
 #include <util/dstr.h>
 #include <util/task.h>
 
+#include <math.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -51,6 +52,8 @@
 #define S_FADE "fade_ms"
 #define S_FADE_LOOP "fade_loop"
 #define S_FADE_SINGLE "fade_single"
+#define S_NORMALIZE "normalize"
+#define S_NORM_TARGET "normalize_target"
 #define S_HW_DECODE "hw_decode"
 #define S_WIDTH "width"
 #define S_HEIGHT "height"
@@ -66,7 +69,15 @@
 #define MAX_SCAN_DEPTH 8
 #define MIN_FADE_MS 50
 #define MAX_FADE_MS 5000
-#define GAIN_SCALE 1000                        /* audio gain stored as an integer, 0..GAIN_SCALE */
+#define GAIN_SCALE 1000 /* audio gain stored as an integer, 0..GAIN_SCALE */
+/* audio normalization */
+#define NORM_MAX_BOOST 4.0f                    /* +12 dB */
+#define NORM_MAX_CUT 0.25f                     /* -12 dB */
+#define NORM_GATE_MS 1.0e-5                    /* ignore near-silence (below -50 dBFS RMS) */
+#define NORM_PEAK_LIMIT 0.89f                  /* keep peaks under about -1 dBFS */
+#define NORM_FAST_TAU 0.3f                     /* seconds, while a clip's level is first measured */
+#define NORM_SLOW_TAU 2.0f                     /* seconds, afterwards */
+#define NORM_FAST_SECONDS 1.0f                 /* how long the fast phase lasts */
 #define MAX_LOOP_FAILURES 3                    /* end a loop after this many unplayable clips in a row */
 #define START_TIMEOUT_NS (10ULL * 1000000000ULL) /* give up if a clip never starts */
 #define MIN_CLIP_AGE_NS (500ULL * 1000000ULL)    /* ignore state checks right after start */
@@ -123,7 +134,15 @@ struct random_clip {
 
 	/* audio fade: target gain set by tick, applied by the audio callback */
 	volatile long gain;
-	float last_gain;     /* audio callback thread only */
+	float last_gain; /* audio callback thread only */
+
+	/* audio normalization: settings shared with the audio callback,
+	 * measurement state used only by the audio callback */
+	volatile long normalize;
+	volatile long norm_target_db;
+	float norm_gain;
+	double norm_energy;
+	uint64_t norm_frames;
 	float *gain_buf;     /* audio callback thread only */
 	size_t gain_buf_len; /* in floats */
 	bool looping;        /* a loop session is running */
@@ -339,6 +358,58 @@ static obs_source_t *get_child_ref(struct random_clip *rc)
 
 /* Relays the clip's audio (already converted to OBS's mix format) out of this
  * source, so it gets this source's mixer fader, filters and monitoring. */
+/* Audio normalization: measures the clip's average level as it plays
+ * (gated mean square, ignoring near-silence) and moves a gain toward the
+ * target level. The gain settles quickly at the start of a clip, then only
+ * drifts slowly, so the clip's own dynamics are kept. It is capped at
+ * +/-12 dB and lowered for any packet whose peaks would exceed about -1 dBFS.
+ * Returns the normalization gain for this packet. */
+static float update_normalization(struct random_clip *rc, const struct audio_data *audio, size_t channels, float fade)
+{
+	size_t frames = audio->frames;
+	double sumsq = 0.0;
+	float peak = 0.0f;
+
+	for (size_t ch = 0; ch < channels && ch < MAX_AV_PLANES; ch++) {
+		const float *in = (const float *)audio->data[ch];
+		if (!in)
+			continue;
+		for (size_t i = 0; i < frames; i++) {
+			float v = in[i];
+			sumsq += (double)v * (double)v;
+			float a = fabsf(v);
+			if (a > peak)
+				peak = a;
+		}
+	}
+
+	double mean_square = sumsq / (double)(channels * frames);
+	if (mean_square > NORM_GATE_MS) {
+		rc->norm_energy += mean_square * (double)frames;
+		rc->norm_frames += frames;
+	}
+
+	if (rc->norm_frames > 0) {
+		float level = (float)sqrt(rc->norm_energy / (double)rc->norm_frames);
+		float target = powf(10.0f, (float)os_atomic_load_long(&rc->norm_target_db) / 20.0f);
+		float desired = target / level;
+		if (desired > NORM_MAX_BOOST)
+			desired = NORM_MAX_BOOST;
+		if (desired < NORM_MAX_CUT)
+			desired = NORM_MAX_CUT;
+
+		float measured_s = (float)rc->norm_frames / (float)rc->samples_per_sec;
+		float tau = measured_s < NORM_FAST_SECONDS ? NORM_FAST_TAU : NORM_SLOW_TAU;
+		float alpha = 1.0f - expf(-(float)frames / (tau * (float)rc->samples_per_sec));
+		rc->norm_gain += (desired - rc->norm_gain) * alpha;
+	}
+
+	float gain = rc->norm_gain;
+	if (peak * gain * fade > NORM_PEAK_LIMIT && peak > 0.0f && fade > 0.0f)
+		gain = NORM_PEAK_LIMIT / (peak * fade);
+	return gain;
+}
+
 static void forward_audio(void *param, obs_source_t *child, const struct audio_data *audio, bool muted)
 {
 	UNUSED_PARAMETER(child);
@@ -354,16 +425,26 @@ static void forward_audio(void *param, obs_source_t *child, const struct audio_d
 	out.samples_per_sec = rc->samples_per_sec;
 	out.timestamp = audio->timestamp;
 
-	/* Fading: scale a copy of the samples, ramping from the previous gain
-	 * to the new one across the packet so the volume changes smoothly.
-	 * At full volume the samples are passed through untouched. */
-	float gain = (float)os_atomic_load_long(&rc->gain) / (float)GAIN_SCALE;
+	size_t channels = get_audio_channels(rc->speakers);
+	size_t frames = audio->frames;
+
+	/* total gain = fade level x normalization gain */
+	float fade = (float)os_atomic_load_long(&rc->gain) / (float)GAIN_SCALE;
+	float gain = fade;
 	float start = rc->last_gain;
+
+	if (os_atomic_load_long(&rc->normalize) && frames && channels) {
+		float norm = update_normalization(rc, audio, channels, fade);
+		gain = fade * norm;
+		if (gain < start && norm < rc->norm_gain)
+			start = gain; /* peak limiting: don't ramp down from above the limit */
+	}
 	rc->last_gain = gain;
 
-	if ((gain < 1.0f || start < 1.0f) && audio->frames) {
-		size_t channels = get_audio_channels(rc->speakers);
-		size_t frames = audio->frames;
+	/* Scale a copy of the samples, ramping from the previous gain to the new
+	 * one across the packet so the volume changes smoothly. At unity gain
+	 * the samples are passed through untouched. */
+	if ((fabsf(gain - 1.0f) > 1e-4f || fabsf(start - 1.0f) > 1e-4f) && frames && channels) {
 		size_t needed = channels * frames;
 
 		if (rc->gain_buf_len < needed) {
@@ -510,6 +591,9 @@ static void install_pending(struct random_clip *rc)
 	pthread_mutex_unlock(&rc->mutex);
 	rc->opacity = rc->clip_fades ? 0.0f : 1.0f;
 	rc->last_gain = rc->opacity; /* callback not registered yet, safe to set */
+	rc->norm_gain = 1.0f;        /* new clip: measure its level from scratch */
+	rc->norm_energy = 0.0;
+	rc->norm_frames = 0;
 	os_atomic_set_long(&rc->gain, rc->clip_fades ? 0 : GAIN_SCALE);
 
 	obs_source_add_audio_capture_callback(child, forward_audio, rc);
@@ -725,6 +809,8 @@ static void rc_update(void *data, obs_data_t *settings)
 	rc->fade_loop = obs_data_get_bool(settings, S_FADE_LOOP);
 	rc->fade_single = obs_data_get_bool(settings, S_FADE_SINGLE);
 	rc->hw_decode = obs_data_get_bool(settings, S_HW_DECODE);
+	os_atomic_set_long(&rc->normalize, obs_data_get_bool(settings, S_NORMALIZE) ? 1 : 0);
+	os_atomic_set_long(&rc->norm_target_db, (long)obs_data_get_int(settings, S_NORM_TARGET));
 	rc->cx = (uint32_t)obs_data_get_int(settings, S_WIDTH);
 	rc->cy = (uint32_t)obs_data_get_int(settings, S_HEIGHT);
 	pthread_mutex_unlock(&rc->mutex);
@@ -737,6 +823,7 @@ static void *rc_create(obs_data_t *settings, obs_source_t *source)
 	rc->seen_scene_gen = os_atomic_load_long(&scene_gen);
 	rc->opacity = 1.0f;
 	rc->last_gain = 1.0f;
+	rc->norm_gain = 1.0f;
 	rc->gain = GAIN_SCALE;
 	rc->rng = os_gettime_ns() ^ ((uint64_t)(uintptr_t)rc << 16);
 	rng_next(&rc->rng);
@@ -806,9 +893,19 @@ static void rc_get_defaults(obs_data_t *settings)
 	obs_data_set_default_bool(settings, S_AUTOSTART, false);
 	obs_data_set_default_bool(settings, S_STOP_ON_SCENE, true);
 	obs_data_set_default_bool(settings, S_STOP_ON_HIDE, true);
+	obs_data_set_default_bool(settings, S_NORMALIZE, false);
+	obs_data_set_default_int(settings, S_NORM_TARGET, -20);
 	obs_data_set_default_bool(settings, S_HW_DECODE, false);
 	obs_data_set_default_int(settings, S_WIDTH, w);
 	obs_data_set_default_int(settings, S_HEIGHT, h);
+}
+
+/* Only show the normalization target while normalization is on. */
+static bool normalize_toggle_changed(obs_properties_t *props, obs_property_t *p, obs_data_t *settings)
+{
+	UNUSED_PARAMETER(p);
+	obs_property_set_visible(obs_properties_get(props, S_NORM_TARGET), obs_data_get_bool(settings, S_NORMALIZE));
+	return true;
 }
 
 /* Only show the fade duration while at least one fade toggle is on. */
@@ -844,6 +941,12 @@ static obs_properties_t *rc_get_properties(void *data)
 	obs_properties_add_bool(props, S_AUTOSTART, T_("AutoStart"));
 	obs_properties_add_bool(props, S_STOP_ON_SCENE, T_("StopOnSceneChange"));
 	obs_properties_add_bool(props, S_STOP_ON_HIDE, T_("StopOnHide"));
+	obs_property_t *normalize = obs_properties_add_bool(props, S_NORMALIZE, T_("Normalize"));
+	obs_property_set_long_description(normalize, T_("Normalize.Description"));
+	obs_property_t *target =
+		obs_properties_add_int_slider(props, S_NORM_TARGET, T_("NormalizeTarget"), -30, -10, 1);
+	obs_property_int_set_suffix(target, " dB");
+	obs_property_set_modified_callback(normalize, normalize_toggle_changed);
 	obs_properties_add_bool(props, S_HW_DECODE, T_("HardwareDecode"));
 	obs_properties_add_int(props, S_WIDTH, T_("Width"), 1, 16384, 1);
 	obs_properties_add_int(props, S_HEIGHT, T_("Height"), 1, 16384, 1);
