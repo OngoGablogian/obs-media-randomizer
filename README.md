@@ -23,13 +23,18 @@ An OBS Studio source plugin that plays a random video clip from a folder when yo
 
 ## Installation
 
-1. Download the latest build from the [Releases](https://github.com/OngoGablogian/obs-random-clip/releases) page.
-2. Extract it so that the plugin ends up here:
-   - **Windows:** `C:\ProgramData\obs-studio\plugins\obs-random-clip\`
-   - **Linux:** `~/.config/obs-studio/plugins/obs-random-clip/`
-3. Restart OBS.
+Download the latest build for your system from the [Releases](https://github.com/OngoGablogian/obs-random-clip/releases) page.
 
-The folder should contain `bin\64bit\obs-random-clip.dll` (or `.so` on Linux) and `data\locale\en-US.ini`.
+**Windows:** extract the zip into your OBS folder (usually `C:\Program Files\obs-studio`) and allow it to merge with the existing folders. That puts the files here:
+
+- `obs-plugins\64bit\obs-random-clip.dll`
+- `data\obs-plugins\obs-random-clip\locale\en-US.ini`
+
+**macOS:** run the `.pkg` installer.
+
+**Ubuntu:** install the `.deb` package.
+
+Restart OBS after installing.
 
 ## Usage
 

@@ -49,23 +49,34 @@ function Package {
 
     $OutputName = "${ProductName}-${ProductVersion}-windows-${Target}"
 
+    $InstallRoot = "${ProjectRoot}/release/${Configuration}/${ProductName}"
+    $StageRoot = "${ProjectRoot}/release/${OutputName}"
+
     $RemoveArgs = @{
         ErrorAction = 'SilentlyContinue'
+        Recurse = $true
+        Force = $true
         Path = @(
             "${ProjectRoot}/release/${ProductName}-*-windows-*.zip"
+            $StageRoot
         )
     }
 
     Remove-Item @RemoveArgs
 
-    Log-Group "Archiving ${ProductName}..."
-    $CompressArgs = @{
-        Path = (Get-ChildItem -Path "${ProjectRoot}/release/${Configuration}" -Exclude "${OutputName}*.*")
-        CompressionLevel = 'Optimal'
-        DestinationPath = "${ProjectRoot}/release/${OutputName}.zip"
-        Verbose = ($Env:CI -ne $null)
-    }
-    Compress-Archive -Force @CompressArgs
+    # Stage the files in the same layout as an OBS installation, so the
+    # artifact's contents can be dropped straight into the OBS folder:
+    #   obs-plugins/64bit/<plugin>.dll
+    #   data/obs-plugins/<plugin>/locale/en-US.ini
+    Log-Group "Staging ${ProductName} in the OBS folder layout..."
+    $PluginDir = "${StageRoot}/obs-plugins/64bit"
+    $DataDir = "${StageRoot}/data/obs-plugins/${ProductName}"
+
+    New-Item -ItemType Directory -Force -Path $PluginDir, $DataDir | Out-Null
+    Copy-Item -Path "${InstallRoot}/bin/64bit/*.dll" -Destination $PluginDir
+    Copy-Item -Path "${InstallRoot}/data/*" -Destination $DataDir -Recurse
+
+    Get-ChildItem -Path $StageRoot -Recurse -File | ForEach-Object { Write-Information $_.FullName }
     Log-Group
 }
 
