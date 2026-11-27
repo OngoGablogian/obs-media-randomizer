@@ -54,6 +54,7 @@
 #define S_FADE_SINGLE "fade_single"
 #define S_NORMALIZE "normalize"
 #define S_NORM_TARGET "normalize_target"
+#define S_NORM_MAX_BOOST "normalize_max_boost"
 #define S_HW_DECODE "hw_decode"
 #define S_WIDTH "width"
 #define S_HEIGHT "height"
@@ -71,9 +72,10 @@
 #define MAX_FADE_MS 5000
 #define GAIN_SCALE 1000 /* audio gain stored as an integer, 0..GAIN_SCALE */
 /* audio normalization */
-#define NORM_MAX_BOOST 4.0f                    /* +12 dB */
 #define NORM_MAX_CUT 0.25f                     /* -12 dB */
-#define NORM_GATE_MS 1.0e-5                    /* ignore near-silence (below -50 dBFS RMS) */
+#define NORM_FLOOR_DB -70                      /* never count audio below -70 dBFS RMS */
+#define NORM_REL_GATE_DB 20.0                  /* ignore audio this far below the clip's overall average */
+#define NORM_BINS 71                           /* level histogram: one bin per dB, -70..0 dBFS */
 #define NORM_PEAK_LIMIT 0.89f                  /* keep peaks under about -1 dBFS */
 #define NORM_FAST_TAU 0.3f                     /* seconds, while a clip's level is first measured */
 #define NORM_SLOW_TAU 2.0f                     /* seconds, afterwards */
@@ -140,8 +142,10 @@ struct random_clip {
 	 * measurement state used only by the audio callback */
 	volatile long normalize;
 	volatile long norm_target_db;
+	volatile long norm_max_boost_db;
+	bool norm_logged;
 	float norm_gain;
-	double norm_energy;
+	uint64_t norm_hist[NORM_BINS]; /* audio frames measured at each level */
 	uint64_t norm_frames;
 	float *gain_buf;     /* audio callback thread only */
 	size_t gain_buf_len; /* in floats */
@@ -383,22 +387,66 @@ static float update_normalization(struct random_clip *rc, const struct audio_dat
 		}
 	}
 
+	/* Record this packet's level (in dB) in a small histogram. */
 	double mean_square = sumsq / (double)(channels * frames);
-	if (mean_square > NORM_GATE_MS) {
-		rc->norm_energy += mean_square * (double)frames;
-		rc->norm_frames += frames;
+	if (mean_square > 0.0) {
+		double packet_db = 10.0 * log10(mean_square);
+		if (packet_db > (double)NORM_FLOOR_DB) {
+			int bin = (int)lround(packet_db) - NORM_FLOOR_DB;
+			if (bin >= NORM_BINS)
+				bin = NORM_BINS - 1;
+			rc->norm_hist[bin] += frames;
+			rc->norm_frames += frames;
+		}
 	}
 
 	if (rc->norm_frames > 0) {
-		float level = (float)sqrt(rc->norm_energy / (double)rc->norm_frames);
-		float target = powf(10.0f, (float)os_atomic_load_long(&rc->norm_target_db) / 20.0f);
+		/* Typical level = average in dB, ignoring audio more than 20 dB below
+		 * the clip's overall average (gaps, pauses). Gating relative to the
+		 * whole clip, as loudness meters do, keeps a loud start from hiding
+		 * the rest. Averaging in dB keeps short loud bursts (gunshots) from
+		 * making a mostly quiet clip count as loud. */
+		double all_sum = 0.0;
+		for (int i = 0; i < NORM_BINS; i++)
+			all_sum += (double)(i + NORM_FLOOR_DB) * (double)rc->norm_hist[i];
+		double overall_db = all_sum / (double)rc->norm_frames;
+		double gate_db = overall_db - NORM_REL_GATE_DB;
+
+		double gated_sum = 0.0, gated_frames = 0.0;
+		for (int i = 0; i < NORM_BINS; i++) {
+			double bin_db = (double)(i + NORM_FLOOR_DB);
+			if (bin_db >= gate_db && rc->norm_hist[i]) {
+				gated_sum += bin_db * (double)rc->norm_hist[i];
+				gated_frames += (double)rc->norm_hist[i];
+			}
+		}
+		double level_db = gated_frames > 0.0 ? gated_sum / gated_frames : overall_db;
+		float level = powf(10.0f, (float)level_db / 20.0f);
+		float target_db = (float)os_atomic_load_long(&rc->norm_target_db);
+		float max_boost_db = (float)os_atomic_load_long(&rc->norm_max_boost_db);
+		float target = powf(10.0f, target_db / 20.0f);
+		float max_boost = powf(10.0f, max_boost_db / 20.0f);
 		float desired = target / level;
-		if (desired > NORM_MAX_BOOST)
-			desired = NORM_MAX_BOOST;
+		bool capped = desired > max_boost;
+		if (desired > max_boost)
+			desired = max_boost;
 		if (desired < NORM_MAX_CUT)
 			desired = NORM_MAX_CUT;
 
 		float measured_s = (float)rc->norm_frames / (float)rc->samples_per_sec;
+
+		/* report once per clip, after the first second of measured audio */
+		if (!rc->norm_logged && measured_s >= NORM_FAST_SECONDS) {
+			rc->norm_logged = true;
+			pthread_mutex_lock(&rc->mutex);
+			const char *name = rc->last_file ? rc->last_file : "";
+			const char *slash = strrchr(name, '/');
+			blog(LOG_INFO, "[Random Clip Player] Normalizing '%s': level %.1f dB, gain %+.1f dB%s",
+			     slash ? slash + 1 : name, 20.0f * log10f(level), 20.0f * log10f(desired),
+			     capped ? " (at maximum boost)" : "");
+			pthread_mutex_unlock(&rc->mutex);
+		}
+
 		float tau = measured_s < NORM_FAST_SECONDS ? NORM_FAST_TAU : NORM_SLOW_TAU;
 		float alpha = 1.0f - expf(-(float)frames / (tau * (float)rc->samples_per_sec));
 		rc->norm_gain += (desired - rc->norm_gain) * alpha;
@@ -592,8 +640,9 @@ static void install_pending(struct random_clip *rc)
 	rc->opacity = rc->clip_fades ? 0.0f : 1.0f;
 	rc->last_gain = rc->opacity; /* callback not registered yet, safe to set */
 	rc->norm_gain = 1.0f;        /* new clip: measure its level from scratch */
-	rc->norm_energy = 0.0;
+	memset(rc->norm_hist, 0, sizeof(rc->norm_hist));
 	rc->norm_frames = 0;
+	rc->norm_logged = false;
 	os_atomic_set_long(&rc->gain, rc->clip_fades ? 0 : GAIN_SCALE);
 
 	obs_source_add_audio_capture_callback(child, forward_audio, rc);
@@ -811,6 +860,7 @@ static void rc_update(void *data, obs_data_t *settings)
 	rc->hw_decode = obs_data_get_bool(settings, S_HW_DECODE);
 	os_atomic_set_long(&rc->normalize, obs_data_get_bool(settings, S_NORMALIZE) ? 1 : 0);
 	os_atomic_set_long(&rc->norm_target_db, (long)obs_data_get_int(settings, S_NORM_TARGET));
+	os_atomic_set_long(&rc->norm_max_boost_db, (long)obs_data_get_int(settings, S_NORM_MAX_BOOST));
 	rc->cx = (uint32_t)obs_data_get_int(settings, S_WIDTH);
 	rc->cy = (uint32_t)obs_data_get_int(settings, S_HEIGHT);
 	pthread_mutex_unlock(&rc->mutex);
@@ -895,6 +945,7 @@ static void rc_get_defaults(obs_data_t *settings)
 	obs_data_set_default_bool(settings, S_STOP_ON_HIDE, true);
 	obs_data_set_default_bool(settings, S_NORMALIZE, false);
 	obs_data_set_default_int(settings, S_NORM_TARGET, -20);
+	obs_data_set_default_int(settings, S_NORM_MAX_BOOST, 18);
 	obs_data_set_default_bool(settings, S_HW_DECODE, false);
 	obs_data_set_default_int(settings, S_WIDTH, w);
 	obs_data_set_default_int(settings, S_HEIGHT, h);
@@ -904,7 +955,9 @@ static void rc_get_defaults(obs_data_t *settings)
 static bool normalize_toggle_changed(obs_properties_t *props, obs_property_t *p, obs_data_t *settings)
 {
 	UNUSED_PARAMETER(p);
-	obs_property_set_visible(obs_properties_get(props, S_NORM_TARGET), obs_data_get_bool(settings, S_NORMALIZE));
+	bool on = obs_data_get_bool(settings, S_NORMALIZE);
+	obs_property_set_visible(obs_properties_get(props, S_NORM_TARGET), on);
+	obs_property_set_visible(obs_properties_get(props, S_NORM_MAX_BOOST), on);
 	return true;
 }
 
@@ -946,6 +999,10 @@ static obs_properties_t *rc_get_properties(void *data)
 	obs_property_t *target =
 		obs_properties_add_int_slider(props, S_NORM_TARGET, T_("NormalizeTarget"), -30, -10, 1);
 	obs_property_int_set_suffix(target, " dB");
+	obs_property_t *max_boost =
+		obs_properties_add_int_slider(props, S_NORM_MAX_BOOST, T_("NormalizeMaxBoost"), 0, 24, 1);
+	obs_property_int_set_suffix(max_boost, " dB");
+	obs_property_set_long_description(max_boost, T_("NormalizeMaxBoost.Description"));
 	obs_property_set_modified_callback(normalize, normalize_toggle_changed);
 	obs_properties_add_bool(props, S_HW_DECODE, T_("HardwareDecode"));
 	obs_properties_add_int(props, S_WIDTH, T_("Width"), 1, 16384, 1);

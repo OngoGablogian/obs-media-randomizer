@@ -65,8 +65,9 @@ You can also use the **Play Random Clip** and **Stop Clip** buttons in the sourc
 | Start playing automatically when switching to a scene with this source | Off | Starts a clip (or a loop, if loop mode is on) when you switch to a scene where the source is visible |
 | Stop the clip when the scene changes | On | Stops the clip on any scene switch, even if the new scene also contains this source |
 | Stop the clip when the source is hidden | On | Stops the clip when the source is hidden or its scene goes out of view |
-| Normalize audio levels between clips | Off | Measures each clip's average level while it plays and brings it toward the target, so loud and quiet clips end up at a similar volume. Changes are capped at 12 dB up or down, and peaks are kept under about -1 dBFS. It takes about half a second to measure each new clip, then only adjusts slowly, so the clip's own loud and quiet moments are kept |
+| Normalize audio levels between clips | Off | Measures each clip's typical level while it plays and brings it toward the target, so loud and quiet clips end up at a similar volume. The level is averaged in dB and ignores pauses, so short loud sounds (gunshots, explosions) don't make a mostly quiet clip count as loud. Peaks are kept under about -1 dBFS. It takes about half a second to measure each new clip, then only adjusts slowly, so the clip's own loud and quiet moments are kept. Each clip's measured level and gain are written to the OBS log |
 | Target level | -20 dB | Average level clips are brought toward when normalization is on (-30 to -10 dB). Shown only while normalization is on |
+| Maximum boost | 18 dB | How much quiet clips can be turned up (0 to 24 dB). Loud clips can be turned down by up to 12 dB. Higher values bring very quiet clips closer to the target but also raise their background noise. Shown only while normalization is on |
 | Use hardware decoding when available | Off | Decodes clips on the GPU instead of the CPU |
 | Width / Height | Canvas size | Size of the source. Clips are scaled to fit and centered |
 
