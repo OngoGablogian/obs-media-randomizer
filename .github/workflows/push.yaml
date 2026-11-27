@@ -41,19 +41,28 @@ jobs:
           if [[ "${RUNNER_DEBUG}" ]]; then set -x; fi
           shopt -s extglob
 
-          case "${GITHUB_REF_NAME}" in
+          # Accepts 1.2.3 or v1.2.3, plus -beta/-rc pre-releases (1.2.3-beta1).
+          # The release keeps the tag as pushed; file names use the version
+          # without the "v".
+          tag="${GITHUB_REF_NAME}"
+          version="${tag#v}"
+
+          case "${version}" in
             +([0-9]).+([0-9]).+([0-9]) )
               echo 'validTag=true' >> $GITHUB_OUTPUT
               echo 'prerelease=false' >> $GITHUB_OUTPUT
-              echo "version=${GITHUB_REF_NAME}" >> $GITHUB_OUTPUT
               ;;
             +([0-9]).+([0-9]).+([0-9])-@(beta|rc)*([0-9]) )
               echo 'validTag=true' >> $GITHUB_OUTPUT
               echo 'prerelease=true' >> $GITHUB_OUTPUT
-              echo "version=${GITHUB_REF_NAME}" >> $GITHUB_OUTPUT
               ;;
-            *) echo 'validTag=false' >> $GITHUB_OUTPUT ;;
+            *)
+              echo 'validTag=false' >> $GITHUB_OUTPUT
+              echo "::warning::Tag '${tag}' is not a release version (expected 1.2.3 or v1.2.3), so no release was created"
+              ;;
           esac
+          echo "tag=${tag}" >> $GITHUB_OUTPUT
+          echo "version=${version}" >> $GITHUB_OUTPUT
 
       - name: Download Build Artifacts
         uses: actions/download-artifact@v8
@@ -69,28 +78,32 @@ jobs:
 
           root_dir="$(pwd)"
           release_dir="${root_dir}/release-files"
+          commit_hash="${GITHUB_SHA:0:9}"
           mkdir -p "${release_dir}"
 
           # Only the standard packages go on the release (no debug symbols or
-          # sources), each as one zip named <plugin>-<version>-<platform>.zip,
-          # taken from its artifact folder, e.g. obs-media-randomizer-1.0.1-windows-x64.zip
+          # sources), each as one zip named <plugin>-<version>-<platform>.zip:
+          # the artifact name without its commit hash, e.g.
+          # obs-media-randomizer-1.0.1-windows-x64-b7a638935 -> obs-media-randomizer-1.0.1-windows-x64.zip
 
           # Windows: the artifact is a folder in the OBS install layout, zip it once
-          for dir in *-windows-x64/; do
+          for dir in *-windows-x64-${commit_hash}/; do
             dir="${dir%/}"
-            (cd "${dir}" && zip -qr "${release_dir}/${dir}.zip" .)
+            name="${dir%-${commit_hash}}"
+            (cd "${dir}" && zip -qr "${release_dir}/${name}.zip" .)
           done
 
           # macOS: the .pkg installer, zipped
           # Ubuntu: the .deb package, zipped (debug symbols are a separate artifact)
           staging="$(mktemp -d)"
-          for pattern in '*-macos-universal/;pkg' '*-ubuntu-*-x86_64/;deb'; do
+          for pattern in "*-macos-universal-${commit_hash}/;pkg" "*-ubuntu-*-x86_64-${commit_hash}/;deb"; do
             IFS=';' read -r dir_glob ext <<< "${pattern}"
             for dir in ${dir_glob}; do
               dir="${dir%/}"
+              name="${dir%-${commit_hash}}"
               for file in "${dir}"/*.${ext}; do
-                cp "${file}" "${staging}/${dir}.${ext}"
-                (cd "${staging}" && zip -q "${release_dir}/${dir}.zip" "${dir}.${ext}")
+                cp "${file}" "${staging}/${name}.${ext}"
+                (cd "${staging}" && zip -q "${release_dir}/${name}.zip" "${name}.${ext}")
               done
             done
           done
@@ -125,7 +138,7 @@ jobs:
         with:
           draft: false
           prerelease: ${{ fromJSON(steps.check.outputs.prerelease) }}
-          tag_name: ${{ steps.check.outputs.version }}
+          tag_name: ${{ steps.check.outputs.tag }}
           name: ${{ needs.build-project.outputs.pluginName }} ${{ steps.check.outputs.version }}
           body_path: ${{ github.workspace }}/CHECKSUMS.txt
           files: |
