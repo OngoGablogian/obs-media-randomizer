@@ -49,6 +49,7 @@
 #define S_AUTOSTART "autostart"
 #define S_STOP_ON_SCENE "stop_on_scene_change"
 #define S_STOP_ON_HIDE "stop_on_hide"
+#define S_LOOP_DELAY "loop_delay"
 #define S_FADE "fade_ms"
 #define S_FADE_LOOP "fade_loop"
 #define S_FADE_SINGLE "fade_single"
@@ -74,6 +75,7 @@
 #define REPEAT_NOT_TWICE 1 /* never the same clip twice in a row */
 #define REPEAT_SHUFFLE 2   /* every clip once before any repeats */
 #define MAX_SCAN_DEPTH 8
+#define MAX_LOOP_DELAY_S 60.0
 #define MIN_FADE_MS 50
 #define MAX_FADE_MS 5000
 #define GAIN_SCALE 1000 /* audio gain stored as an integer, 0..GAIN_SCALE */
@@ -128,6 +130,7 @@ struct media_randomizer {
 	bool hw_decode;
 	uint32_t cx;
 	uint32_t cy;
+	double loop_delay_s;
 	int fade_ms;
 	bool fade_loop;
 	bool fade_single;
@@ -164,6 +167,7 @@ struct media_randomizer {
 	size_t gain_buf_len; /* in floats */
 	bool looping;        /* a loop session is running */
 	int loop_failures;
+	uint64_t next_load_ns; /* loop delay: when to load the next file, 0 = none */
 	long seen_scene_gen;
 
 	/* random number state, only used by this source's worker thread */
@@ -758,6 +762,7 @@ static void free_fade_texture(struct media_randomizer *rc)
 /* Graphics thread: queue a background load unless one is already running. */
 static void queue_load(struct media_randomizer *rc)
 {
+	rc->next_load_ns = 0;
 	if (!rc->loader || os_atomic_set_bool(&rc->loading, true))
 		return;
 
@@ -802,6 +807,7 @@ static void start_playing(struct media_randomizer *rc, bool from_autostart)
 static void stop_playing(struct media_randomizer *rc)
 {
 	rc->looping = false;
+	rc->next_load_ns = 0;
 	cancel_loads(rc);
 	stop_clip(rc);
 }
@@ -901,6 +907,7 @@ static void rc_update(void *data, obs_data_t *settings)
 	rc->autostart = obs_data_get_bool(settings, S_AUTOSTART);
 	rc->stop_on_scene = obs_data_get_bool(settings, S_STOP_ON_SCENE);
 	rc->stop_on_hide = obs_data_get_bool(settings, S_STOP_ON_HIDE);
+	rc->loop_delay_s = obs_data_get_double(settings, S_LOOP_DELAY);
 	rc->fade_ms = (int)obs_data_get_int(settings, S_FADE);
 	rc->fade_loop = obs_data_get_bool(settings, S_FADE_LOOP);
 	rc->fade_single = obs_data_get_bool(settings, S_FADE_SINGLE);
@@ -984,6 +991,7 @@ static void rc_get_defaults(obs_data_t *settings)
 	obs_data_set_default_int(settings, S_MEDIA_TYPES, MEDIA_ALL);
 	obs_data_set_default_bool(settings, S_INTERRUPT, true);
 	obs_data_set_default_bool(settings, S_LOOP, false);
+	obs_data_set_default_double(settings, S_LOOP_DELAY, 0.0);
 	obs_data_set_default_bool(settings, S_FADE_LOOP, true);
 	obs_data_set_default_bool(settings, S_FADE_SINGLE, false);
 	obs_data_set_default_int(settings, S_FADE, 500);
@@ -996,6 +1004,14 @@ static void rc_get_defaults(obs_data_t *settings)
 	obs_data_set_default_bool(settings, S_HW_DECODE, false);
 	obs_data_set_default_int(settings, S_WIDTH, w);
 	obs_data_set_default_int(settings, S_HEIGHT, h);
+}
+
+/* Only show the loop delay while looping is on. */
+static bool loop_toggle_changed(obs_properties_t *props, obs_property_t *p, obs_data_t *settings)
+{
+	UNUSED_PARAMETER(p);
+	obs_property_set_visible(obs_properties_get(props, S_LOOP_DELAY), obs_data_get_bool(settings, S_LOOP));
+	return true;
 }
 
 /* Only show the normalization target while normalization is on. */
@@ -1034,7 +1050,12 @@ static obs_properties_t *rc_get_properties(void *data)
 	obs_property_list_add_int(repeat, T_("RepeatMode.NotTwice"), REPEAT_NOT_TWICE);
 	obs_property_list_add_int(repeat, T_("RepeatMode.Allow"), REPEAT_ALLOW);
 	obs_properties_add_bool(props, S_INTERRUPT, T_("Interrupt"));
-	obs_properties_add_bool(props, S_LOOP, T_("Loop"));
+	obs_property_t *loop = obs_properties_add_bool(props, S_LOOP, T_("Loop"));
+	obs_property_t *loop_delay =
+		obs_properties_add_float_slider(props, S_LOOP_DELAY, T_("LoopDelay"), 0.0, MAX_LOOP_DELAY_S, 0.5);
+	obs_property_float_set_suffix(loop_delay, " s");
+	obs_property_set_long_description(loop_delay, T_("LoopDelay.Description"));
+	obs_property_set_modified_callback(loop, loop_toggle_changed);
 	obs_property_t *fade_loop = obs_properties_add_bool(props, S_FADE_LOOP, T_("FadeLoop"));
 	obs_property_t *fade_single = obs_properties_add_bool(props, S_FADE_SINGLE, T_("FadeSingle"));
 	obs_property_t *fade =
@@ -1113,6 +1134,14 @@ static void rc_tick(void *data, float seconds)
 	if (os_atomic_set_bool(&rc->pending_ready, false))
 		install_pending(rc);
 
+	/* loop delay: load the next file once the wait is over */
+	if (rc->next_load_ns) {
+		if (!rc->looping)
+			rc->next_load_ns = 0;
+		else if (os_gettime_ns() >= rc->next_load_ns)
+			queue_load(rc);
+	}
+
 	if (!os_atomic_load_bool(&rc->has_clip)) {
 		free_fade_texture(rc);
 		return;
@@ -1140,8 +1169,18 @@ static void rc_tick(void *data, float seconds)
 			rc->looping = false;
 			blog(LOG_WARNING, "[Media Randomizer] Loop stopped: %d files in a row failed to play",
 			     MAX_LOOP_FAILURES);
+		} else if (rc->clip_played) {
+			/* wait the loop delay (if any) before loading the next file;
+			 * nothing is loaded during the wait */
+			pthread_mutex_lock(&rc->mutex);
+			double delay_s = rc->loop_delay_s;
+			pthread_mutex_unlock(&rc->mutex);
+			if (delay_s > 0.0)
+				rc->next_load_ns = os_gettime_ns() + (uint64_t)(delay_s * 1000000000.0);
+			else
+				queue_load(rc);
 		} else {
-			queue_load(rc);
+			queue_load(rc); /* the file failed to play: try another right away */
 		}
 	}
 }

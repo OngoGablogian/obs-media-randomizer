@@ -61,6 +61,7 @@ You can also use the **Play Random File** and **Stop Playback** buttons in the s
 | Repeats | Play every file once before any repeat | **Play every file once before any repeat:** shuffles through the whole folder, then starts a new round (never starting with the file that just played). **Never the same file twice in a row:** fully random except for back-to-back repeats. **Fully random:** any file can play at any time |
 | Hotkey while a file is playing starts a new one | On | When off, presses during playback are ignored. In loop mode this skips to the next file |
 | Loop random files until stopped or the scene changes | Off | Plays random files back to back. Every file plays once before any repeats, whatever the Repeats setting. Ends when you press **Stop Playback**, the source is hidden, or the scene changes |
+| Delay between looped files | 0 s | How long to wait after a file ends before the next one starts (0 to 60 seconds). Nothing is loaded during the wait, and pressing **Play Random File** skips it. Shown only while looping is on |
 | Fade looped files in and out | On | In loop mode, each file fades in at its start and out at its end |
 | Fade single files in and out | Off | Same, for files started with the hotkey or button outside loop mode |
 | Fade duration | 500 ms | Length of each fade-in and fade-out (50–5000 ms). Video and audio fade together. Hidden while both fade toggles are off. Pressing **Stop Playback** or switching scenes still cuts immediately |
